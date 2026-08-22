@@ -64,14 +64,22 @@ async function checkPrice() {
       }
     });
 
+    let lastError = null;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       offers = [];
-      await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      lastResponseAt = Date.now();
+      lastError = null;
+      try {
+        await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        lastResponseAt = Date.now();
 
-      const deadline = Date.now() + MAX_WAIT_MS;
-      while (Date.now() < deadline && Date.now() - lastResponseAt < IDLE_MS) {
-        await page.waitForTimeout(POLL_INTERVAL_MS);
+        const deadline = Date.now() + MAX_WAIT_MS;
+        while (Date.now() < deadline && Date.now() - lastResponseAt < IDLE_MS) {
+          await page.waitForTimeout(POLL_INTERVAL_MS);
+        }
+      } catch (e) {
+        // Сайт иногда просто не открывается за 30с (сетевой сбой/подвисание) —
+        // это тоже неудачная попытка, а не повод сразу сдаваться.
+        lastError = e;
       }
 
       if (offers.length > 0) break;
@@ -79,6 +87,7 @@ async function checkPrice() {
     }
 
     if (offers.length === 0) {
+      if (lastError) throw lastError;
       return { found: false };
     }
 
