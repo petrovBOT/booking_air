@@ -73,7 +73,7 @@ async function handleAnswer(chatId, text) {
   state.index += 1;
 
   if (state.index >= FIELDS.length) {
-    profile.setUserData(chatId, state.values);
+    await profile.setUserData(chatId, state.values);
     states.delete(chatId);
     await sendMessage(chatId, 'Готово, данные сохранены. Проверить можно командой /profile.', removeKeyboard);
     return;

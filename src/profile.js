@@ -11,45 +11,48 @@ function defaultsFor(chatId) {
   };
 }
 
-function getPassenger(chatId) {
+async function getPassenger(chatId) {
   const d = defaultsFor(chatId);
-  return { ...d.passenger, ...(store.loadUser(chatId).passenger || {}) };
+  const user = await store.loadUser(chatId);
+  return { ...d.passenger, ...(user.passenger || {}) };
 }
 
-function getContact(chatId) {
+async function getContact(chatId) {
   const d = defaultsFor(chatId);
-  return { ...d.contact, ...(store.loadUser(chatId).contact || {}) };
+  const user = await store.loadUser(chatId);
+  return { ...d.contact, ...(user.contact || {}) };
 }
 
-function setUserData(chatId, partial) {
-  store.saveUser(chatId, partial);
+async function setUserData(chatId, partial) {
+  await store.saveUser(chatId, partial);
 }
 
 // Профиль считается заполненным, когда есть всё нужное для брони,
 // кроме гражданства/типа документа/кода телефона — у них есть жёсткие дефолты.
-function isProfileComplete(chatId) {
-  const p = getPassenger(chatId);
-  const c = getContact(chatId);
+async function isProfileComplete(chatId) {
+  const p = await getPassenger(chatId);
+  const c = await getContact(chatId);
   return Boolean(
     p.gender && p.birthDate && p.documentNumber && p.lastName && p.firstName && c.email && c.phoneNumber
   );
 }
 
-function isBooked(chatId) {
-  return Boolean(store.loadUser(chatId).booked);
+async function isBooked(chatId) {
+  const user = await store.loadUser(chatId);
+  return Boolean(user.booked);
 }
 
-function markBooked(chatId, info) {
-  store.saveUser(chatId, { booked: info });
+async function markBooked(chatId, info) {
+  await store.saveUser(chatId, { booked: info });
 }
 
-function getPriceThreshold() {
-  const saved = store.load().priceThreshold;
-  return typeof saved === 'number' ? saved : config.PRICE_THRESHOLD_RUB;
+async function getPriceThreshold() {
+  const data = await store.load();
+  return typeof data.priceThreshold === 'number' ? data.priceThreshold : config.PRICE_THRESHOLD_RUB;
 }
 
-function setPriceThreshold(value) {
-  store.saveGlobal({ priceThreshold: value });
+async function setPriceThreshold(value) {
+  await store.saveGlobal({ priceThreshold: value });
 }
 
 // Все, кому разрешено пользоваться ботом: владелец + ALLOWED_CHAT_IDS из .env.

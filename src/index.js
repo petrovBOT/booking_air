@@ -38,11 +38,11 @@ let checking = false;
 // Каждому — своя попытка и свой алерт, в его личный чат.
 async function bookForAllUsers(price, currency) {
   for (const chatId of profile.allowedChatIds()) {
-    if (!profile.isProfileComplete(chatId)) {
+    if (!(await profile.isProfileComplete(chatId))) {
       console.log(`[booking] у ${chatId} не заполнен профиль — пропускаю`);
       continue;
     }
-    if (profile.isBooked(chatId)) {
+    if (await profile.isBooked(chatId)) {
       console.log(`[booking] у ${chatId} уже есть бронь — пропускаю`);
       continue;
     }
@@ -50,7 +50,7 @@ async function bookForAllUsers(price, currency) {
     await sendMessage(chatId, `Цена подходит: ${price} ${currency}. Пробую оформить бронь...`);
     try {
       const booking = await attemptBooking(chatId, stage => console.log(`[booking:${chatId}] этап: ${stage}`));
-      profile.markBooked(chatId, { at: new Date().toISOString(), price });
+      await profile.markBooked(chatId, { at: new Date().toISOString(), price });
       const caption = formatOrderCaption(booking.summary, [
         '',
         `Ссылка на оплату: ${booking.paymentLink}`,
@@ -73,7 +73,7 @@ async function runCheck(source, requesterChatId) {
   checking = true;
   const startedAt = Date.now();
   try {
-    const threshold = profile.getPriceThreshold();
+    const threshold = await profile.getPriceThreshold();
     console.log(`[${source}] запускаю проверку цены...`);
     const result = await checkPrice();
     const ms = Date.now() - startedAt;
@@ -109,8 +109,9 @@ async function runCheck(source, requesterChatId) {
 }
 
 async function showProfile(chatId) {
-  const p = profile.getPassenger(chatId);
-  const c = profile.getContact(chatId);
+  const p = await profile.getPassenger(chatId);
+  const c = await profile.getContact(chatId);
+  const booked = await profile.isBooked(chatId);
   await sendMessage(
     chatId,
     [
@@ -121,7 +122,7 @@ async function showProfile(chatId) {
       `ФИО: ${[p.lastName, p.firstName, p.middleName].filter(Boolean).join(' ') || '—'}`,
       `Email: ${c.email || '—'}`,
       `Телефон: ${c.phoneCountry || '—'} ${c.phoneNumber || '—'}`,
-      `Бронь: ${profile.isBooked(chatId) ? 'уже оформлена' : 'ещё нет'}`,
+      `Бронь: ${booked ? 'уже оформлена' : 'ещё нет'}`,
       '',
       'Изменить: /setup',
     ].join('\n')
@@ -156,6 +157,7 @@ function formatTargetLeg(legs) {
 }
 
 async function showSettings(chatId) {
+  const threshold = await profile.getPriceThreshold();
   await sendMessage(
     chatId,
     [
@@ -163,7 +165,7 @@ async function showSettings(chatId) {
       `Рейс обратно: ${formatTargetLeg(TARGET.inbound)}`,
       '(маршрут зафиксирован в коде, меняется только через config.js)',
       '',
-      `Порог цены: ${profile.getPriceThreshold()} ₽`,
+      `Порог цены: ${threshold} ₽`,
       `Интервал автопроверки: ${CHECK_INTERVAL_MINUTES} мин`,
       profile.isOwner(chatId) ? '\nИзменить порог: /threshold <сумма>' : '',
     ].join('\n')
@@ -202,12 +204,15 @@ listenForMessages(async (chatId, text) => {
     if (!arg || !Number.isFinite(value) || value <= 0) {
       return sendMessage(chatId, 'Формат: /threshold 120000 (сумма в рублях, только цифры).');
     }
-    profile.setPriceThreshold(value);
+    await profile.setPriceThreshold(value);
     return sendMessage(chatId, `Порог цены обновлён: ${value} ₽`);
   }
   if (text === '/cancel') return sendMessage(chatId, 'Сейчас нечего отменять.');
 });
 
-console.log(`Бот запущен. Интервал проверки: ${CHECK_INTERVAL_MINUTES} мин. Порог цены: ${profile.getPriceThreshold()} ₽`);
-console.log('Разрешённые chat_id:', profile.allowedChatIds().join(', '));
-runCheck('startup');
+(async () => {
+  const threshold = await profile.getPriceThreshold();
+  console.log(`Бот запущен. Интервал проверки: ${CHECK_INTERVAL_MINUTES} мин. Порог цены: ${threshold} ₽`);
+  console.log('Разрешённые chat_id:', profile.allowedChatIds().join(', '));
+  runCheck('startup');
+})();

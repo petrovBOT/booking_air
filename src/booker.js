@@ -214,8 +214,8 @@ async function step(name, fn) {
 async function attemptBooking(chatId, onProgress = () => {}) {
   // Свежее чтение на каждый запуск — так изменения через /setup в Telegram
   // подхватываются без перезапуска процесса. chatId — чей именно профиль бронируем.
-  const PASSENGER = getPassenger(chatId);
-  const CONTACT = getContact(chatId);
+  const PASSENGER = await getPassenger(chatId);
+  const CONTACT = await getContact(chatId);
 
   const browser = await chromium.launch({
     headless: HEADLESS,
