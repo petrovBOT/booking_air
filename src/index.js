@@ -23,6 +23,15 @@ const { sendMessage, sendPhoto, listenForMessages } = require('./telegram');
 const profile = require('./profile');
 const wizard = require('./wizard');
 
+// На Render free web-сервисы засыпают без входящего HTTP-трафика — это заглушка
+// под внешний пинг (UptimeRobot/cron-job.org), сам бот с ней никак не взаимодействует.
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('ok');
+}).listen(PORT, () => console.log(`Health-check сервер слушает порт ${PORT}`));
+
 let checking = false;
 
 // Бронирует по очереди на каждого, у кого готов профиль и кто ещё не бронировал.

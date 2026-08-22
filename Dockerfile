@@ -10,4 +10,6 @@ RUN npx playwright install --with-deps chromium-headless-shell
 
 COPY src ./src
 
+EXPOSE 3000
+
 CMD ["node", "src/index.js"]
