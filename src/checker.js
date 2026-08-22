@@ -1,8 +1,18 @@
 const { chromium } = require('playwright');
-const { SEARCH_URL, AD_DOMAINS, TASK_WAIT_MS, TARGET } = require('./config');
+const { SEARCH_URL, AD_DOMAINS, TARGET } = require('./config');
 const { findOffers } = require('./matcher');
 
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet']);
+
+// Поставщики отвечают асинхронно и не одновременно: дешёвые (напр. myagent)
+// обычно готовы позже дорогих (travelport и т.п.). Раньше ждали фиксированные
+// 25с и брали минимум из того, что успело прийти — если дешёвый поставщик
+// не укладывался, бот репортил цену вдвое-втрое выше реальной. Теперь ждём,
+// пока поток ответов /next/api/task не затихнет (сайт сам перестаёт поллить
+// задачи, включая зависшие), с потолком на случай, если затишья не наступит.
+const IDLE_MS = 10000;
+const MAX_WAIT_MS = 90000;
+const POLL_INTERVAL_MS = 500;
 
 async function checkPrice() {
   const browser = await chromium.launch({
@@ -25,6 +35,7 @@ async function checkPrice() {
 
     const offers = [];
     const page = await context.newPage();
+    let lastResponseAt = Date.now();
 
     page.on('response', async resp => {
       const url = resp.url();
@@ -36,6 +47,7 @@ async function checkPrice() {
       } catch {
         return;
       }
+      lastResponseAt = Date.now();
       const tasks = data.tasks && data.tasks.avia;
       if (!tasks) return;
       for (const tid in tasks) {
@@ -46,7 +58,12 @@ async function checkPrice() {
     });
 
     await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(TASK_WAIT_MS);
+    lastResponseAt = Date.now();
+
+    const deadline = Date.now() + MAX_WAIT_MS;
+    while (Date.now() < deadline && Date.now() - lastResponseAt < IDLE_MS) {
+      await page.waitForTimeout(POLL_INTERVAL_MS);
+    }
 
     if (offers.length === 0) {
       return { found: false };

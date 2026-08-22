@@ -12,9 +12,6 @@ module.exports = {
   // Как часто гонять автоматическую проверку (минуты).
   CHECK_INTERVAL_MINUTES: Number(process.env.CHECK_INTERVAL_MINUTES) || 20,
 
-  // Сколько ждать после захода на страницу, пока поставщики отдадут результаты поиска.
-  TASK_WAIT_MS: Number(process.env.TASK_WAIT_MS) || 25000,
-
   // ?search=...&refSearch=true запускает свежий поиск сразу при заходе,
   // без этого сайт просто предзаполняет форму и ждёт клика.
   SEARCH_URL: 'https://superkassa.ru/?search=LED2512HKT1601100&refSearch=true',
