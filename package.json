@@ -1,0 +1,13 @@
+{
+  "name": "superkassa-price-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dry-run": "node scripts/dry-run.js"
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}

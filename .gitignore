@@ -1,0 +1,5 @@
+node_modules/
+.env
+profile.json
+scripts/dry-run-result.png
+*.log
