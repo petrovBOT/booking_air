@@ -11,7 +11,7 @@ const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet'])
 // пока поток ответов /next/api/task не затихнет (сайт сам перестаёт поллить
 // задачи, включая зависшие), с потолком на случай, если затишья не наступит.
 const IDLE_MS = 10000;
-const MAX_WAIT_MS = 90000;
+const MAX_WAIT_MS = 120000;
 const POLL_INTERVAL_MS = 500;
 
 // Даже когда все поставщики честно ответили, конкретно нужная пара
@@ -19,7 +19,7 @@ const POLL_INTERVAL_MS = 500;
 // поиске секунды спустя та же связка нередко находится. Поэтому при пустом
 // результате повторяем поиск ещё несколько раз, прежде чем сдаться.
 const MAX_ATTEMPTS = 3;
-const RETRY_DELAY_MS = 3000;
+const RETRY_DELAY_MS = 15000;
 
 async function checkPrice() {
   const browser = await chromium.launch({

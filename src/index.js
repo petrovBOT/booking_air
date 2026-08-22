@@ -16,7 +16,7 @@ if (fs.existsSync(envFile)) {
     });
 }
 
-const { CHECK_INTERVAL_MINUTES, TARGET } = require('./config');
+const { TARGET, TELEGRAM_CHAT_ID } = require('./config');
 const { checkPrice } = require('./checker');
 const { attemptBooking, formatOrderCaption } = require('./booker');
 const { sendMessage, sendPhoto, listenForMessages } = require('./telegram');
@@ -72,6 +72,10 @@ async function runCheck(source, requesterChatId) {
   }
   checking = true;
   const startedAt = Date.now();
+  // Владелец получает пуш с результатом каждой проверки (включая cron/startup),
+  // кроме случая, когда он же сам её и запросил — тогда сообщение как requester не дублируем.
+  const isOwnerRequester = Boolean(requesterChatId) && profile.isOwner(requesterChatId);
+  const notifyOwner = text => (isOwnerRequester ? Promise.resolve() : sendMessage(TELEGRAM_CHAT_ID, `[${source}] ${text}`));
   try {
     const threshold = await profile.getPriceThreshold();
     console.log(`[${source}] запускаю проверку цены...`);
@@ -80,16 +84,22 @@ async function runCheck(source, requesterChatId) {
 
     if (!result.found) {
       console.log(`[${source}] целевой рейс/тариф не найден в выдаче (${ms}мс)`);
-      if (requesterChatId) await sendMessage(requesterChatId, 'Целевой рейс не найден в текущей выдаче. Возможно, сайт изменился или рейса нет в продаже.');
+      const text = 'Целевой рейс не найден в текущей выдаче. Возможно, сайт изменился или рейса нет в продаже.';
+      if (requesterChatId) await sendMessage(requesterChatId, text);
+      await notifyOwner(text);
       return;
     }
 
     console.log(`[${source}] цена: ${result.price} ${result.currency}, вариантов найдено: ${result.offersCount} (${ms}мс)`);
 
     if (result.price > threshold) {
-      if (requesterChatId) await sendMessage(requesterChatId, `Текущая цена: ${result.price} ${result.currency} (порог ${threshold} ₽, ещё не достигнут)`);
+      const text = `Текущая цена: ${result.price} ${result.currency} (порог ${threshold} ₽, ещё не достигнут)`;
+      if (requesterChatId) await sendMessage(requesterChatId, text);
+      await notifyOwner(text);
       return;
     }
+
+    await notifyOwner(`Цена подходящая: ${result.price} ${result.currency} (порог ${threshold} ₽) — запускаю бронирование.`);
 
     if (requesterChatId && source === 'manual') {
       // Ручная проверка одного человека не должна тайно бронировать на всех —
@@ -102,7 +112,9 @@ async function runCheck(source, requesterChatId) {
     await bookForAllUsers(result.price, result.currency);
   } catch (e) {
     console.error(`[${source}] ошибка проверки:`, e);
-    if (requesterChatId) await sendMessage(requesterChatId, `Ошибка при проверке цены: ${e.message}`);
+    const text = `Ошибка при проверке цены: ${e.message}`;
+    if (requesterChatId) await sendMessage(requesterChatId, text);
+    await notifyOwner(text);
   } finally {
     checking = false;
   }
@@ -131,7 +143,8 @@ async function showProfile(chatId) {
 
 async function showInfo(chatId) {
   const admin = profile.isOwner(chatId)
-    ? '\n/threshold <сумма> — изменить порог цены (только владелец)'
+    ? '\n/threshold <сумма> — изменить порог цены (только владелец)' +
+      '\n/interval <минуты> — изменить интервал автопроверки (только владелец)'
     : '';
   await sendMessage(
     chatId,
@@ -158,6 +171,7 @@ function formatTargetLeg(legs) {
 
 async function showSettings(chatId) {
   const threshold = await profile.getPriceThreshold();
+  const interval = await profile.getCheckIntervalMinutes();
   await sendMessage(
     chatId,
     [
@@ -166,13 +180,21 @@ async function showSettings(chatId) {
       '(маршрут зафиксирован в коде, меняется только через config.js)',
       '',
       `Порог цены: ${threshold} ₽`,
-      `Интервал автопроверки: ${CHECK_INTERVAL_MINUTES} мин`,
-      profile.isOwner(chatId) ? '\nИзменить порог: /threshold <сумма>' : '',
+      `Интервал автопроверки: ${interval} мин`,
+      profile.isOwner(chatId) ? '\nИзменить порог: /threshold <сумма>\nИзменить интервал: /interval <минуты>' : '',
     ].join('\n')
   );
 }
 
-setInterval(() => runCheck('cron'), CHECK_INTERVAL_MINUTES * 60 * 1000);
+let cronTimer = null;
+
+// Перезапускает таймер автопроверки с текущим сохранённым интервалом —
+// вызывается при старте и при каждом изменении через /interval.
+async function scheduleCron() {
+  if (cronTimer) clearInterval(cronTimer);
+  const interval = await profile.getCheckIntervalMinutes();
+  cronTimer = setInterval(() => runCheck('cron'), interval * 60 * 1000);
+}
 
 listenForMessages(async (chatId, text) => {
   if (!profile.isAllowed(chatId)) {
@@ -207,12 +229,27 @@ listenForMessages(async (chatId, text) => {
     await profile.setPriceThreshold(value);
     return sendMessage(chatId, `Порог цены обновлён: ${value} ₽`);
   }
+  if (text.startsWith('/interval')) {
+    if (!profile.isOwner(chatId)) {
+      return sendMessage(chatId, 'Интервал автопроверки может менять только владелец бота.');
+    }
+    const arg = text.replace('/interval', '').trim().replace(/[^\d]/g, '');
+    const value = Number(arg);
+    if (!arg || !Number.isFinite(value) || value <= 0) {
+      return sendMessage(chatId, 'Формат: /interval 20 (минуты, только цифры).');
+    }
+    await profile.setCheckIntervalMinutes(value);
+    await scheduleCron();
+    return sendMessage(chatId, `Интервал автопроверки обновлён: ${value} мин`);
+  }
   if (text === '/cancel') return sendMessage(chatId, 'Сейчас нечего отменять.');
 });
 
 (async () => {
   const threshold = await profile.getPriceThreshold();
-  console.log(`Бот запущен. Интервал проверки: ${CHECK_INTERVAL_MINUTES} мин. Порог цены: ${threshold} ₽`);
+  const interval = await profile.getCheckIntervalMinutes();
+  console.log(`Бот запущен. Интервал проверки: ${interval} мин. Порог цены: ${threshold} ₽`);
   console.log('Разрешённые chat_id:', profile.allowedChatIds().join(', '));
+  await scheduleCron();
   runCheck('startup');
 })();

@@ -55,6 +55,15 @@ async function setPriceThreshold(value) {
   await store.saveGlobal({ priceThreshold: value });
 }
 
+async function getCheckIntervalMinutes() {
+  const data = await store.load();
+  return typeof data.checkIntervalMinutes === 'number' ? data.checkIntervalMinutes : config.CHECK_INTERVAL_MINUTES;
+}
+
+async function setCheckIntervalMinutes(value) {
+  await store.saveGlobal({ checkIntervalMinutes: value });
+}
+
 // Все, кому разрешено пользоваться ботом: владелец + ALLOWED_CHAT_IDS из .env.
 function allowedChatIds() {
   return [String(config.TELEGRAM_CHAT_ID), ...config.ALLOWED_CHAT_IDS].filter(Boolean);
@@ -77,6 +86,8 @@ module.exports = {
   markBooked,
   getPriceThreshold,
   setPriceThreshold,
+  getCheckIntervalMinutes,
+  setCheckIntervalMinutes,
   allowedChatIds,
   isAllowed,
   isOwner,
