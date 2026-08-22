@@ -14,6 +14,13 @@ const IDLE_MS = 10000;
 const MAX_WAIT_MS = 90000;
 const POLL_INTERVAL_MS = 500;
 
+// Даже когда все поставщики честно ответили, конкретно нужная пара
+// туда+обратно у них иногда не складывается в единый тариф — при повторном
+// поиске секунды спустя та же связка нередко находится. Поэтому при пустом
+// результате повторяем поиск ещё несколько раз, прежде чем сдаться.
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 3000;
+
 async function checkPrice() {
   const browser = await chromium.launch({
     headless: true,
@@ -33,7 +40,7 @@ async function checkPrice() {
       return route.continue();
     });
 
-    const offers = [];
+    let offers = [];
     const page = await context.newPage();
     let lastResponseAt = Date.now();
 
@@ -57,12 +64,18 @@ async function checkPrice() {
       }
     });
 
-    await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    lastResponseAt = Date.now();
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      offers = [];
+      await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      lastResponseAt = Date.now();
 
-    const deadline = Date.now() + MAX_WAIT_MS;
-    while (Date.now() < deadline && Date.now() - lastResponseAt < IDLE_MS) {
-      await page.waitForTimeout(POLL_INTERVAL_MS);
+      const deadline = Date.now() + MAX_WAIT_MS;
+      while (Date.now() < deadline && Date.now() - lastResponseAt < IDLE_MS) {
+        await page.waitForTimeout(POLL_INTERVAL_MS);
+      }
+
+      if (offers.length > 0) break;
+      if (attempt < MAX_ATTEMPTS) await page.waitForTimeout(RETRY_DELAY_MS);
     }
 
     if (offers.length === 0) {
