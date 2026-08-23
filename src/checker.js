@@ -21,10 +21,32 @@ const POLL_INTERVAL_MS = 500;
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 15000;
 
+// Render free — 512MB на весь процесс, headless Chromium сам по себе прожорливый.
+// Эти флаги гасят фоновые таймеры/синк/расширения, которые Chromium иначе
+// держит активными даже в headless — без них память на длинных проверках
+// (потолок ожидания в несколько минут) быстрее упирается в лимит.
+const CHROMIUM_ARGS = [
+  '--no-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  '--disable-background-networking',
+  '--disable-default-apps',
+  '--disable-extensions',
+  '--disable-sync',
+  '--disable-translate',
+  '--metrics-recording-only',
+  '--mute-audio',
+  '--no-first-run',
+  '--safebrowsing-disable-auto-update',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-renderer-backgrounding',
+];
+
 async function checkPrice() {
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    args: CHROMIUM_ARGS,
   });
 
   try {
@@ -41,33 +63,39 @@ async function checkPrice() {
     });
 
     let offers = [];
-    const page = await context.newPage();
     let lastResponseAt = Date.now();
 
-    page.on('response', async resp => {
-      const url = resp.url();
-      if (!url.includes('/next/api/task')) return;
-      let data;
-      try {
-        const buf = await resp.body();
-        data = JSON.parse(buf.toString('utf8'));
-      } catch {
-        return;
-      }
-      lastResponseAt = Date.now();
-      const tasks = data.tasks && data.tasks.avia;
-      if (!tasks) return;
-      for (const tid in tasks) {
-        const t = tasks[tid];
-        if (t.status !== 'ok' || !t.result) continue;
-        offers.push(...findOffers(t, TARGET));
-      }
-    });
+    function attachListener(page) {
+      page.on('response', async resp => {
+        const url = resp.url();
+        if (!url.includes('/next/api/task')) return;
+        let data;
+        try {
+          const buf = await resp.body();
+          data = JSON.parse(buf.toString('utf8'));
+        } catch {
+          return;
+        }
+        lastResponseAt = Date.now();
+        const tasks = data.tasks && data.tasks.avia;
+        if (!tasks) return;
+        for (const tid in tasks) {
+          const t = tasks[tid];
+          if (t.status !== 'ok' || !t.result) continue;
+          offers.push(...findOffers(t, TARGET));
+        }
+      });
+    }
 
     let lastError = null;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       offers = [];
       lastError = null;
+      // Новая страница на каждую попытку, а не повторный goto на старой —
+      // Chromium не всегда отдаёт память рендерера обратно после навигации
+      // в рамках той же страницы, а тут попытки суммарно могут висеть минутами.
+      const page = await context.newPage();
+      attachListener(page);
       try {
         await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
         lastResponseAt = Date.now();
@@ -80,10 +108,12 @@ async function checkPrice() {
         // Сайт иногда просто не открывается за 30с (сетевой сбой/подвисание) —
         // это тоже неудачная попытка, а не повод сразу сдаваться.
         lastError = e;
+      } finally {
+        await page.close().catch(() => {});
       }
 
       if (offers.length > 0) break;
-      if (attempt < MAX_ATTEMPTS) await page.waitForTimeout(RETRY_DELAY_MS);
+      if (attempt < MAX_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
     }
 
     if (offers.length === 0) {
