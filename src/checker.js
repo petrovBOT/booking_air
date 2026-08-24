@@ -84,8 +84,35 @@ async function checkPrice() {
     let taskResponsesSeen = 0;
     let taskResponsesOk = 0;
     let requestFailures = 0;
+    let totalRequests = 0;
+    let apiRequests = 0;
+    let taskRequestsSent = 0;
+    let firstTaskRequestLogged = false;
 
     function attachListener(page) {
+      // Считаем вообще все запросы (не только /next/api/task) — если их за 18с+
+      // открытия страницы единицы, значит зависает что-то на самом раннем этапе
+      // (DNS/TLS через туннель), а не сама логика поиска на странице.
+      page.on('request', req => {
+        totalRequests++;
+        const url = req.url();
+        if (!url.includes('/api/')) return;
+        apiRequests++;
+        if (!url.includes('/next/api/task')) return;
+        taskRequestsSent++;
+        // Их сотни за один поиск (сайт опрашивает статус задач) — логируем
+        // только первый факт, чтобы подтвердить, что поиск вообще стартовал,
+        // а не заваливать лог сотнями одинаковых строк.
+        if (!firstTaskRequestLogged) {
+          firstTaskRequestLogged = true;
+          console.log(`[checker] первый запрос к API поиска: ${url.slice(0, 150)}`);
+        }
+      });
+
+      page.on('console', msg => {
+        if (msg.type() !== 'error' || msg.text().includes('ERR_BLOCKED_BY_CLIENT')) return;
+        console.log(`[checker] консоль страницы (error): ${msg.text().slice(0, 200)}`);
+      });
       page.on('response', async resp => {
         const url = resp.url();
         if (!url.includes('/next/api/task')) return;
@@ -133,6 +160,10 @@ async function checkPrice() {
       taskResponsesSeen = 0;
       taskResponsesOk = 0;
       requestFailures = 0;
+      totalRequests = 0;
+      apiRequests = 0;
+      taskRequestsSent = 0;
+      firstTaskRequestLogged = false;
       const attemptStartedAt = Date.now();
       console.log(`[checker] попытка ${attempt}/${MAX_ATTEMPTS}: открываю страницу поиска...`);
       // Новая страница на каждую попытку, а не повторный goto на старой —
@@ -142,7 +173,9 @@ async function checkPrice() {
       attachListener(page);
       try {
         await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        console.log(`[checker] попытка ${attempt}: страница открылась за ${Date.now() - attemptStartedAt}мс, жду данные...`);
+        console.log(
+          `[checker] попытка ${attempt}: страница открылась за ${Date.now() - attemptStartedAt}мс (запросов сделано к этому моменту: ${totalRequests}), жду данные...`
+        );
         lastResponseAt = Date.now();
 
         const deadline = Date.now() + MAX_WAIT_MS;
@@ -152,13 +185,13 @@ async function checkPrice() {
           if (Date.now() - lastHeartbeatAt >= 10000) {
             lastHeartbeatAt = Date.now();
             console.log(
-              `[checker] попытка ${attempt}: ещё жду (${Math.round((Date.now() - attemptStartedAt) / 1000)}с) — ответов: ${taskResponsesSeen} (ok: ${taskResponsesOk}), совпадений: ${offers.length}, сбоев запросов: ${requestFailures}`
+              `[checker] попытка ${attempt}: ещё жду (${Math.round((Date.now() - attemptStartedAt) / 1000)}с) — запросов всего: ${totalRequests} (к /api/: ${apiRequests}), запросов /next/api/task отправлено: ${taskRequestsSent}, ответов: ${taskResponsesSeen} (ok: ${taskResponsesOk}), совпадений: ${offers.length}, сбоев запросов: ${requestFailures}`
             );
           }
         }
         const exitReason = Date.now() >= deadline ? 'исчерпан потолок ожидания' : 'поток ответов затих';
         console.log(
-          `[checker] попытка ${attempt}: закончил ждать (${exitReason}) — ответов /next/api/task: ${taskResponsesSeen} (ok: ${taskResponsesOk}), совпадений с целевым маршрутом: ${offers.length}, сбоев запросов: ${requestFailures}, всего ${Date.now() - attemptStartedAt}мс`
+          `[checker] попытка ${attempt}: закончил ждать (${exitReason}) — запросов всего: ${totalRequests} (к /api/: ${apiRequests}), запросов /next/api/task отправлено: ${taskRequestsSent}, ответов: ${taskResponsesSeen} (ok: ${taskResponsesOk}), совпадений с целевым маршрутом: ${offers.length}, сбоев запросов: ${requestFailures}, всего ${Date.now() - attemptStartedAt}мс`
         );
       } catch (e) {
         // Сайт иногда просто не открывается за 30с (сетевой сбой/подвисание) —
