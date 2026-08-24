@@ -2,7 +2,7 @@ const { chromium } = require('playwright');
 const { SEARCH_URL, AD_DOMAINS, TARGET, PROXY } = require('./config');
 const { findOffers } = require('./matcher');
 const { CHROMIUM_ARGS } = require('./chromium-args');
-const { logMemory } = require('./memlog');
+const { logMemory, logCgroupPulse } = require('./memlog');
 
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet']);
 
@@ -253,6 +253,10 @@ async function checkPrice(searchUrl = SEARCH_URL) {
             console.log(
               `[checker] попытка ${attempt}: ещё жду (${Math.round((Date.now() - attemptStartedAt) / 1000)}с) — запросов всего: ${totalRequests} (к /api/: ${apiRequests}), запросов /next/api/task отправлено: ${taskRequestsSent}, ответов: ${taskResponsesSeen} (ok: ${taskResponsesOk}, пропущено повторных: ${skippedRedundantResponses}), совпадений: ${offers.length}, сбоев запросов: ${requestFailures}`
             );
+            // Здесь, пока браузер активно работает (Chromium+Xray в отдельных
+            // процессах ОС), а не в замерах "до/после" — по гипотезе, самое
+            // вероятное место пика суммарной памяти контейнера.
+            logCgroupPulse(`попытка ${attempt}, браузер активен, ${Math.round((Date.now() - attemptStartedAt) / 1000)}с`);
           }
         }
         const exitReason =

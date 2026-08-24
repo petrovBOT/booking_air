@@ -3,7 +3,7 @@ const { SEARCH_URL, AD_DOMAINS, TARGET, PAYMENT_METHOD_LABEL, HEADLESS, PROXY } 
 const { getPassenger, getContact } = require('./profile');
 const { findOffers } = require('./matcher');
 const { CHROMIUM_ARGS } = require('./chromium-args');
-const { logMemory } = require('./memlog');
+const { logMemory, logCgroupPulse } = require('./memlog');
 
 const URLISH_KEY = /url|link|redirect|href|formurl|paymenturl/i;
 
@@ -318,8 +318,14 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
         await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         lastSearchResponseAt = Date.now();
         const deadline = Date.now() + SEARCH_MAX_WAIT_MS;
+        const attemptStartedAt = Date.now();
+        let lastPulseAt = Date.now();
         while (Date.now() < deadline && Date.now() - lastSearchResponseAt < SEARCH_IDLE_MS) {
           await page.waitForTimeout(500);
+          if (Date.now() - lastPulseAt >= 10000) {
+            lastPulseAt = Date.now();
+            logCgroupPulse(`attemptBooking попытка ${attempt}, браузер активен, ${Math.round((Date.now() - attemptStartedAt) / 1000)}с`);
+          }
         }
         if (matchedOffers.length > 0) return;
         if (attempt < SEARCH_MAX_ATTEMPTS) {

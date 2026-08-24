@@ -13,6 +13,15 @@
 // мусор в ожидании сборки. rss при этом всё равно может не совпадать с
 // heapUsed+external — это ожидаемо: rss включает память самого Node-рантайма
 // и то, что аллокатор ОС ещё не вернул системе даже после gc().
+//
+// ВАЖНО: process.memoryUsage() видит только сам Node-процесс. Chromium
+// (browser + renderer) и Xray — отдельные процессы ОС, их память сюда не
+// попадает вообще, а лимит Render в 512MB — это cgroup-лимит на ВЕСЬ
+// контейнер (сумма всех процессов). Поэтому каждый замер дополнительно
+// читает cgroup напрямую из /sys/fs/cgroup — это и есть то самое число,
+// с которым сравнивает OOM-killer, а не косвенная оценка через один Node.
+const fs = require('fs');
+
 const startedAt = Date.now();
 let prev = null;
 let callCount = 0;
@@ -23,6 +32,29 @@ function mb(bytes) {
 
 function fmtDelta(value) {
   return `${value >= 0 ? '+' : ''}${value.toFixed(1)}`;
+}
+
+function readCgroupMemory() {
+  try {
+    const current = Number(fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim());
+    const maxRaw = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+    return { version: 'v2', current, max: maxRaw === 'max' ? null : Number(maxRaw) };
+  } catch {}
+  try {
+    const current = Number(fs.readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim());
+    const maxRaw = Number(fs.readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim());
+    // "Лимита нет" в cgroup v1 отображается гигантским числом (обычно 2^63-ish), а не 'max' как в v2.
+    return { version: 'v1', current, max: maxRaw > Number.MAX_SAFE_INTEGER / 2 ? null : maxRaw };
+  } catch {}
+  return null;
+}
+
+function fmtCgroup(cg) {
+  if (!cg) return ' | cgroup: недоступен (не Linux-контейнер?)';
+  const currentMb = mb(cg.current);
+  if (cg.max == null) return ` | cgroup(${cg.version}): ${currentMb}MB / без лимита`;
+  const pct = Math.round((cg.current / cg.max) * 1000) / 10;
+  return ` | cgroup(${cg.version}): ${currentMb}MB / ${mb(cg.max)}MB (${pct}%)`;
 }
 
 function logMemory(label) {
@@ -42,13 +74,23 @@ function logMemory(label) {
     : '';
   const gcNote = global.gc ? '' : ' [gc() недоступен — запусти с --expose-gc, иначе heap/external завышены]';
   console.log(
-    `[memory #${callCount}] ${label}: rss=${snapshot.rss}MB heapTotal=${snapshot.heapTotal}MB heapUsed=${snapshot.heapUsed}MB external=${snapshot.external}MB arrayBuffers=${snapshot.arrayBuffers}MB, аптайм=${uptimeMin}мин${delta}${gcNote}`
+    `[memory #${callCount}] ${label}: node.rss=${snapshot.rss}MB heapTotal=${snapshot.heapTotal}MB heapUsed=${snapshot.heapUsed}MB external=${snapshot.external}MB arrayBuffers=${snapshot.arrayBuffers}MB${fmtCgroup(readCgroupMemory())}, аптайм=${uptimeMin}мин${delta}${gcNote}`
   );
   // first — RSS самого первого замера за весь процесс, чтобы дельту к нему
   // можно было тащить дальше без отдельной переменной в каждом месте вызова.
   snapshot.first = prev ? prev.first : snapshot.rss;
   prev = snapshot;
   return snapshot;
+}
+
+// Лёгкий "пульс" контейнера — без forced gc() и без process.memoryUsage(),
+// только чтение cgroup (два синхронных чтения файла). Предназначен для вызова
+// прямо ВНУТРИ цикла ожидания ответа сайта (пока браузер жив и активно
+// работает, 50-60с+ по логам) — именно там, по гипотезе, находится пик
+// суммарной памяти контейнера (Chromium+Xray+Node вместе), а не в точках
+// "до/после браузера", которые его не захватывают.
+function logCgroupPulse(label) {
+  console.log(`[memory:pulse] ${label}${fmtCgroup(readCgroupMemory())}`);
 }
 
 // Замер во время простоя (без проверки цены/бронирования) — единственный
@@ -59,4 +101,4 @@ function startHeartbeat(intervalMs = 5 * 60 * 1000) {
   setInterval(() => logMemory('heartbeat (простой, без активной проверки)'), intervalMs).unref();
 }
 
-module.exports = { logMemory, startHeartbeat };
+module.exports = { logMemory, logCgroupPulse, startHeartbeat };
