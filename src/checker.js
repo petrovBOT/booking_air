@@ -4,6 +4,14 @@ const { findOffers } = require('./matcher');
 const { CHROMIUM_ARGS } = require('./chromium-args');
 const { logMemory, logCgroupPulse } = require('./memlog');
 
+// Разовая проверка при старте процесса: New Headless Mode (текущий Chrome по
+// умолчанию под --headless) заметно тяжелее по памяти, чем облегчённый
+// chromium-headless-shell, который мы ставим в Dockerfile — Google из-за
+// этого и выделили headless-shell отдельным бинарником. Playwright ДОЛЖЕН
+// подхватить его автоматически, раз только он и установлен, но это
+// предположение — пусть путь будет виден в логах, а не угадывается.
+console.log(`[checker] исполняемый файл Chromium: ${chromium.executablePath()}`);
+
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet']);
 
 // Чистая телеметрия сайта (debug-log шлётся десятками в секунду, heartbeat и
