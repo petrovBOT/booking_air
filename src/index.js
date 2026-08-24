@@ -26,9 +26,15 @@ let waitingChatIds = [];
 // Бронирует по очереди на каждого, у кого готов профиль и кто ещё не бронировал.
 // Каждому — своя попытка и свой алерт, в его личный чат. searchUrl/label —
 // см. runCheck ниже: /check24 бронирует по своей дате той же логикой.
+// Владелец бота — исключение: он видит все проверки цены и может запросить
+// их сам, но бронь на него никогда не создаётся, только для ALLOWED_CHAT_IDS.
 async function bookForAllUsers(price, currency, searchUrl = SEARCH_URL, label = '') {
   const prefix = label ? `[${label}] ` : '';
   for (const chatId of profile.allowedChatIds()) {
+    if (profile.isOwner(chatId)) {
+      console.log(`[booking] ${chatId} — владелец, бронь не создаём`);
+      continue;
+    }
     if (!(await profile.isProfileComplete(chatId))) {
       console.log(`[booking] у ${chatId} не заполнен профиль — пропускаю`);
       continue;
