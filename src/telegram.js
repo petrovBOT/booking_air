@@ -40,10 +40,17 @@ async function sendPhoto(chatId, buffer, caption) {
     return;
   }
   try {
+    // Определяем формат по сигнатуре, а не по фиксированному image/png: скриншот
+    // заказа теперь снимается в JPEG (booker.js), а отладочные — бывают PNG.
+    const isJpeg = buffer[0] === 0xff && buffer[1] === 0xd8;
     const form = new FormData();
     form.append('chat_id', chatId);
     form.append('caption', caption);
-    form.append('photo', new Blob([buffer], { type: 'image/png' }), 'screenshot.png');
+    form.append(
+      'photo',
+      new Blob([buffer], { type: isJpeg ? 'image/jpeg' : 'image/png' }),
+      isJpeg ? 'screenshot.jpg' : 'screenshot.png'
+    );
     await fetch(api('sendPhoto'), { method: 'POST', body: form });
   } catch (e) {
     console.error('Не удалось отправить фото в Telegram:', e.message);

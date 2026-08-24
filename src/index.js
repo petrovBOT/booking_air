@@ -47,8 +47,20 @@ async function bookForAllUsers(price, currency, searchUrl = SEARCH_URL, label = 
 
     await sendMessage(chatId, `${prefix}Цена подходит: ${price} ${currency}. Пробую оформить бронь...`);
     try {
-      const booking = await attemptBooking(chatId, stage => console.log(`[booking:${chatId}] этап: ${stage}`), searchUrl);
-      await profile.markBooked(chatId, { at: new Date().toISOString(), price });
+      // Ссылка уходит человеку и бронь отмечается в профиле В МОМЕНТ появления
+      // ссылки, а не после возврата из attemptBooking. К этому моменту бронь на
+      // сайте уже создана: если процесс умрёт дальше (скриншот, загрузка фото),
+      // без этого человек остался бы с придержанным местом и без ссылки на
+      // оплату, а бот при следующем /check попробовал бы забронировать повторно.
+      const booking = await attemptBooking(chatId, stage => console.log(`[booking:${chatId}] этап: ${stage}`), searchUrl, {
+        onPaymentLink: async link => {
+          await profile.markBooked(chatId, { at: new Date().toISOString(), price });
+          await sendMessage(
+            chatId,
+            `${prefix}Бронь создана. Ссылка на оплату:\n${link}\n\nОплати вручную в течение отведённого времени. Скриншот заявки пришлю следующим сообщением.`
+          );
+        },
+      });
       const caption = formatOrderCaption(booking.summary, [
         '',
         `Ссылка на оплату: ${booking.paymentLink}`,
@@ -131,6 +143,50 @@ async function runCheck(requesterChatId, searchUrl = SEARCH_URL, label = '') {
   }
 }
 
+// Прогон всего сценария бронирования до заполненной формы включительно, но БЕЗ
+// нажатия "перейти к оплате" — реальная бронь не создаётся. Нужен, чтобы снять
+// профиль памяти и убедиться, что сценарий вообще проходит, ДО того как цена
+// упадёт до порога: иначе первый боевой запуск окажется и первым тестом, а
+// второго шанса в тот момент не будет. Только владелец — поднимает тяжёлый
+// браузер и занимает общий лок с проверками цены.
+async function runBookingTest(requesterChatId, searchUrl = SEARCH_URL, label = '') {
+  if (checking) {
+    await sendMessage(requesterChatId, 'Сейчас уже идёт проверка цены или бронирование. Подожди и повтори.');
+    return;
+  }
+  if (!(await profile.isProfileComplete(requesterChatId))) {
+    await sendMessage(requesterChatId, 'Для тестового прогона нужен заполненный профиль — форма заполняется твоими данными. Задай их через /setup.');
+    return;
+  }
+
+  checking = true;
+  inProgressLabel = label;
+  const prefix = label ? `[${label}] ` : '';
+  const startedAt = Date.now();
+  try {
+    logMemory(`${prefix}testbook: начало (реальная бронь НЕ создаётся)`);
+    await sendMessage(requesterChatId, `${prefix}Тестовый прогон: пройду весь сценарий бронирования до формы оплаты и остановлюсь перед кнопкой. Бронь не создаётся.`);
+    const result = await attemptBooking(
+      requesterChatId,
+      stage => console.log(`[testbook:${requesterChatId}] этап: ${stage}`),
+      searchUrl,
+      { dryRun: true }
+    );
+    const caption = formatOrderCaption(result.summary, [
+      '',
+      `Тестовый прогон занял ${Math.round((Date.now() - startedAt) / 1000)}с. Бронь НЕ создавалась, оплата не запускалась.`,
+    ]);
+    await sendPhoto(requesterChatId, result.screenshot, prefix + caption);
+  } catch (e) {
+    console.error(`${prefix}testbook не удался:`, e);
+    await sendMessage(requesterChatId, `${prefix}Тестовый прогон не дошёл до конца: ${e.message}\n\nЭто и есть цель теста — разобраться сейчас, а не в момент, когда цена упадёт.`);
+  } finally {
+    checking = false;
+    inProgressLabel = null;
+    logMemory(`${prefix}testbook: конец (${Date.now() - startedAt}мс)`);
+  }
+}
+
 async function showProfile(chatId) {
   const p = await profile.getPassenger(chatId);
   const c = await profile.getContact(chatId);
@@ -154,7 +210,8 @@ async function showProfile(chatId) {
 
 async function showInfo(chatId) {
   const admin = profile.isOwner(chatId)
-    ? '\n/threshold <сумма> — изменить порог цены (только владелец)'
+    ? '\n/threshold <сумма> — изменить порог цены (только владелец)' +
+      '\n/testbook — прогон бронирования до формы оплаты без создания брони (/testbook24 — на 24 декабря)'
     : '';
   await sendMessage(
     chatId,
@@ -216,6 +273,14 @@ listenForMessages(async (chatId, text) => {
   if (text === '/info' || text === '/start') return showInfo(chatId);
   if (text === '/check') return runCheck(chatId);
   if (text === '/check24') return runCheck(chatId, SEARCH_URL_DEC24, '24 декабря');
+  if (text === '/testbook' || text === '/testbook24') {
+    if (!profile.isOwner(chatId)) {
+      return sendMessage(chatId, 'Тестовый прогон бронирования может запускать только владелец бота.');
+    }
+    return text === '/testbook24'
+      ? runBookingTest(chatId, SEARCH_URL_DEC24, '24 декабря')
+      : runBookingTest(chatId);
+  }
   if (text === '/setup') return wizard.start(chatId);
   if (text === '/profile') return showProfile(chatId);
   if (text === '/settings') return showSettings(chatId);

@@ -10,12 +10,16 @@ const URLISH_KEY = /url|link|redirect|href|formurl|paymenturl/i;
 // Та же логика ожидания, что и в checker.js: поставщики отвечают асинхронно,
 // ждём затишья в потоке /next/api/task, а не фиксированное время — иначе
 // либо режем медленных поставщиков, либо просто теряем время впустую.
-// MAX_WAIT_MS меньше, чем в checker.js (там 120000) — к моменту вызова
-// attemptBooking цена уже подтверждена checker'ом, и лучше не держать
-// пользователя дольше разумного, но и не резать раньше 30с, которые
-// раньше ждали безусловно.
+//
+// Было 90000 — при том, что отсчёт начинается ПОСЛЕ загрузки страницы (~20с),
+// это давало попытку до 110с, а с повтором и паузой — до 235с непрерывной
+// жизни ОДНОГО браузера ещё до того, как дело дойдёт до формы. По замерам
+// checker.js невытесняемая память растёт всё время, пока открыта страница
+// (2.4-4.8MB/с там), и ровно такой хвост убивал контейнер. Здесь страница
+// заведомо тяжелее (картинки и стили не блокируются — они нужны для
+// раскладки), так что запас нужен больше, а не меньше: 50с, как в checker.
 const SEARCH_IDLE_MS = 10000;
-const SEARCH_MAX_WAIT_MS = 90000;
+const SEARCH_MAX_WAIT_MS = 50000;
 
 // checker.js уже наступал на эти грабли (см. "Повторять поиск при пустом
 // результате" в истории коммитов): нужная пара туда+обратно у поставщиков
@@ -225,27 +229,62 @@ const PAYMENT_TESTIDS = {
 };
 
 async function step(name, fn) {
+  const startedAt = Date.now();
   try {
     await fn();
+    // Замер после каждого шага: сценарий бронирования длинный (перелистывание
+    // выдачи, ожидания селекторов по 20-40с, посимвольный ввод), и до сих пор
+    // мы не знали, на каком именно этапе память растёт быстрее всего. Дёшево
+    // (два чтения файла) и даёт профиль всего пути за один прогон.
+    logCgroupPulse(`шаг "${name}" ок за ${Date.now() - startedAt}мс`);
     return { name, ok: true };
   } catch (e) {
+    logCgroupPulse(`шаг "${name}" УПАЛ за ${Date.now() - startedAt}мс`);
     throw new Error(`шаг "${name}" упал: ${e.message}`);
   }
 }
 
 // searchUrl — по умолчанию основная дата (config.SEARCH_URL); при бронировании
 // по /check24 передаётся config.SEARCH_URL_DEC24, остальной сценарий не меняется.
-async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_URL) {
+// options.dryRun — пройти весь путь до заполненной формы и остановиться ПЕРЕД
+// кнопкой оплаты (реальная бронь не создаётся). options.onPaymentLink —
+// вызывается сразу, как только ссылка поймана, см. шаг "переход к оплате".
+async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_URL, options = {}) {
+  const dryRun = options.dryRun === true || process.env.DRY_RUN === 'true' || process.env.DRY_RUN_AUTO === 'true';
+  // DRY_RUN (в отличие от DRY_RUN_AUTO) — локальный режим "оставить окно
+  // открытым, чтобы посмотреть глазами"; на сервере так делать нельзя.
+  const keepBrowserOpen = process.env.DRY_RUN === 'true';
+  const onPaymentLink = options.onPaymentLink || (async () => {});
+
   // Свежее чтение на каждый запуск — так изменения через /setup в Telegram
   // подхватываются без перезапуска процесса. chatId — чей именно профиль бронируем.
   const PASSENGER = await getPassenger(chatId);
   const CONTACT = await getContact(chatId);
 
-  logMemory('attemptBooking: до запуска браузера');
-  const browser = await chromium.launch({ headless: HEADLESS, args: CHROMIUM_ARGS });
+  let browser = null;
+  let context = null;
+  let page = null;
+  let paymentLink = null;
+  // Выдача приходит как JSON через /next/api/task (та же логика матчинга,
+  // что и в checker.js/matcher.js) — этого достаточно, чтобы понять, есть ли
+  // вообще нужный рейс в текущей выдаче, до того как трогать HTML.
+  let matchedOffers = [];
+  let lastSearchResponseAt = Date.now();
 
-  try {
-    const context = await browser.newContext({
+  async function closeSession() {
+    if (!browser) return;
+    const dying = browser;
+    browser = null;
+    context = null;
+    page = null;
+    await dying.close().catch(() => {});
+  }
+
+  // Каждая попытка поиска — свой браузер целиком (см. цикл ниже), поэтому
+  // слушатели вешаются здесь, на новую страницу, а не один раз на всю функцию.
+  async function openSession() {
+    browser = await chromium.launch({ headless: HEADLESS, args: CHROMIUM_ARGS });
+    context = await browser.newContext({
       userAgent:
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
       viewport: { width: 1400, height: 1400 },
@@ -262,8 +301,7 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
       return route.continue();
     });
 
-    let paymentLink = null;
-    const page = await context.newPage();
+    page = await context.newPage();
 
     page.on('response', async resp => {
       if (paymentLink) return;
@@ -284,11 +322,6 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
       }
     });
 
-    // Выдача приходит как JSON через /next/api/task (та же логика матчинга,
-    // что и в checker.js/matcher.js) — этого достаточно, чтобы понять, есть ли
-    // вообще нужный рейс в текущей выдаче, до того как трогать HTML.
-    let matchedOffers = [];
-    let lastSearchResponseAt = Date.now();
     page.on('response', async resp => {
       const url = resp.url();
       if (!url.includes('/next/api/task')) return;
@@ -308,29 +341,59 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
         matchedOffers.push(...findOffers(t, TARGET));
       }
     });
+  }
 
+  try {
     onProgress('navigate');
     await step('переход на страницу поиска и ожидание данных выдачи', async () => {
       // Повторяем поиск с нуля, если первая попытка ничего не нашла для целевого
       // маршрута — та же нестабильность выдачи, что чинили в checker.js.
       for (let attempt = 1; attempt <= SEARCH_MAX_ATTEMPTS; attempt++) {
+        // Свежий браузер на КАЖДУЮ попытку — ровно то, что спасало checker.js.
+        // Раньше повтор шёл через goto() на том же браузере: память между
+        // попытками не освобождалась, и до формы можно было добраться через
+        // четыре минуты непрерывной жизни одной страницы.
+        logMemory(`attemptBooking: поиск, попытка ${attempt}/${SEARCH_MAX_ATTEMPTS}, до запуска браузера`);
+        await openSession();
         matchedOffers = [];
-        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        lastSearchResponseAt = Date.now();
-        const deadline = Date.now() + SEARCH_MAX_WAIT_MS;
+
         const attemptStartedAt = Date.now();
-        let lastPulseAt = Date.now();
-        while (Date.now() < deadline && Date.now() - lastSearchResponseAt < SEARCH_IDLE_MS) {
-          await page.waitForTimeout(500);
-          if (Date.now() - lastPulseAt >= 10000) {
-            lastPulseAt = Date.now();
-            logCgroupPulse(`attemptBooking попытка ${attempt}, браузер активен, ${Math.round((Date.now() - attemptStartedAt) / 1000)}с`);
+        try {
+          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+          lastSearchResponseAt = Date.now();
+          const deadline = Date.now() + SEARCH_MAX_WAIT_MS;
+          let lastPulseAt = Date.now();
+          while (Date.now() < deadline && Date.now() - lastSearchResponseAt < SEARCH_IDLE_MS) {
+            await page.waitForTimeout(500);
+            // Досрочный выход по первому совпадению: цена и наличие рейса уже
+            // подтверждены checker'ом секундами раньше, здесь JSON нужен только
+            // чтобы убедиться, что рейс есть и в ЭТОЙ выдаче. Досиживать до
+            // затишья после этого — чистая потеря времени и памяти на самом
+            // ответственном участке.
+            if (matchedOffers.length > 0) break;
+            if (Date.now() - lastPulseAt >= 10000) {
+              lastPulseAt = Date.now();
+              logCgroupPulse(`attemptBooking поиск, попытка ${attempt}, ${Math.round((Date.now() - attemptStartedAt) / 1000)}с`);
+            }
           }
+        } catch (e) {
+          console.log(`[booking] поиск, попытка ${attempt}: ${e.message}`);
         }
+
+        logMemory(
+          `attemptBooking: поиск, попытка ${attempt}/${SEARCH_MAX_ATTEMPTS} завершена за ${Date.now() - attemptStartedAt}мс (совпадений: ${matchedOffers.length})`
+        );
+
+        // Нашли — оставляем ЭТУ сессию жить дальше: на её странице уже открыта
+        // нужная выдача, и бронировать продолжаем прямо здесь, без новой загрузки.
         if (matchedOffers.length > 0) return;
+
+        // Не нашли — освобождаем память сразу, а не держим браузер открытым
+        // все 15 секунд паузы перед следующей попыткой.
+        await closeSession();
         if (attempt < SEARCH_MAX_ATTEMPTS) {
           onProgress('navigate-retry');
-          await page.waitForTimeout(SEARCH_RETRY_DELAY_MS);
+          await new Promise(resolve => setTimeout(resolve, SEARCH_RETRY_DELAY_MS));
         }
       }
     });
@@ -545,20 +608,25 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
 
     // Скриншот и сводку по заказу снимаем ДО клика на оплату — после него страница может
     // уйти на домен платёжного шлюза, и order summary с ценой/датами будет уже не прочитать.
-    const screenshot = await page.screenshot({ fullPage: true });
+    // JPEG, а не полностраничный PNG: страница бронирования высокая, и разовый
+    // буфер под неё — заметный всплеск ровно перед самым ответственным кликом.
+    // Качество 85 оставляет текст формы читаемым, а весит кратно меньше.
+    logCgroupPulse('перед снятием скриншота заказа');
+    const screenshot = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 85 });
     const summary = await extractOrderSummary(page, PASSENGER);
+    logCgroupPulse(`скриншот заказа снят (${(screenshot.length / 1024 / 1024).toFixed(1)}MB)`);
     if (process.env.SCREENSHOT_PATH) {
       require('fs').writeFileSync(process.env.SCREENSHOT_PATH, screenshot);
       console.log('Скриншот сохранён:', process.env.SCREENSHOT_PATH);
     }
 
-    if (process.env.DRY_RUN === 'true' || process.env.DRY_RUN_AUTO === 'true') {
+    if (dryRun) {
       onProgress('dry-run-stop');
       console.log('DRY_RUN: форма заполнена, "ПЕРЕЙТИ К ОПЛАТЕ" не нажимаю.');
       console.log(formatOrderCaption(summary));
-      if (process.env.DRY_RUN === 'true') {
+      if (keepBrowserOpen) {
         console.log('Браузер открыт — закрой окно вручную, когда посмотришь.');
-        while (context.pages().length > 0) {
+        while (context && context.pages().length > 0) {
           await new Promise(r => setTimeout(r, 1000));
         }
       }
@@ -575,15 +643,20 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
       if (!paymentLink) {
         throw new Error('ссылка на оплату не появилась за 25с после отправки формы');
       }
+      // Отдаём ссылку наружу НЕМЕДЛЕННО, до возврата из функции и до отправки
+      // скриншота. С этого момента бронь на сайте уже создана и место придержано:
+      // если процесс умрёт на любом следующем шаге, без этого вызова человек
+      // остался бы с существующей бронью, ссылку на оплату которой не знает никто.
+      await onPaymentLink(paymentLink);
     });
 
     return { success: true, paymentLink, screenshot, summary };
   } finally {
-    if (process.env.DRY_RUN !== 'true') {
-      await browser.close().catch(() => {});
-      logMemory('attemptBooking: после закрытия браузера');
-    } else {
+    if (keepBrowserOpen) {
       logMemory('attemptBooking: браузер оставлен открытым (DRY_RUN)');
+    } else {
+      await closeSession();
+      logMemory('attemptBooking: после закрытия браузера');
     }
   }
 }
