@@ -23,7 +23,11 @@ const POLL_INTERVAL_MS = 500;
 // туда+обратно у них иногда не складывается в единый тариф — при повторном
 // поиске секунды спустя та же связка нередко находится. Поэтому при пустом
 // результате повторяем поиск ещё несколько раз, прежде чем сдаться.
-const MAX_ATTEMPTS = 3;
+// Было 3 — но с IDLE_MS=30000 (см. выше) каждая попытка стала заметно дольше
+// и тяжелее по памяти, а на Render уже ловили "Ran out of memory (512MB)"
+// на 3 попытках подряд в одном процессе. Меньше попыток — меньше суммарная
+// нагрузка на память за один вызов.
+const MAX_ATTEMPTS = 2;
 const RETRY_DELAY_MS = 15000;
 
 // Render free — 512MB на весь процесс, headless Chromium сам по себе прожорливый.
@@ -46,141 +50,144 @@ const CHROMIUM_ARGS = [
   '--disable-background-timer-throttling',
   '--disable-backgrounding-occluded-windows',
   '--disable-renderer-backgrounding',
+  // Site Isolation держит отдельный процесс на каждый ориджин — для одной
+  // управляемой страницы это чистый расход памяти без пользы.
+  '--disable-features=site-per-process',
 ];
 
 async function checkPrice() {
   console.log(`[checker] прокси: ${PROXY ? PROXY.server : 'нет, соединение напрямую'}`);
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: CHROMIUM_ARGS,
-  });
+  let offers = [];
+  // Раньше сбрасывалось только ответами /next/api/task — из-за этого на
+  // медленном окружении (прокси + ограниченный CPU на Render) таймер тишины
+  // истекал ДО того, как страница вообще успевала отправить первый запрос
+  // поиска (на это у неё уходило больше времени, чем IDLE_MS). Теперь считаем
+  // живой любую активность к /api/ — сайт всё это время реально работает,
+  // просто медленно, а не "завис".
+  let lastActivityAt = Date.now();
+  // Диагностика: сколько всего ответов /next/api/task пришло за попытку и
+  // сколько из них были status:"ok" — чтобы в логах Render было видно, где
+  // именно затык (прокси вообще не пускает трафик / пускает, но поставщики
+  // не успевают / успевают, но нужного маршрута нет).
+  let taskResponsesSeen = 0;
+  let taskResponsesOk = 0;
+  let requestFailures = 0;
+  let totalRequests = 0;
+  let apiRequests = 0;
+  let taskRequestsSent = 0;
+  let firstTaskRequestLogged = false;
 
-  try {
-    const context = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-      // mincifri.superkassa.ru (и, возможно, другие поддомены сайта) подписаны
-      // российским Minsvyaz/Mintsifry CA ("Russian Trusted Sub CA") — его нет в
-      // доверенном списке Chromium вне России, из-за чего запрос к нему падает
-      // с ERR_CERT_AUTHORITY_INVALID и, похоже, тормозит инициализацию страницы
-      // до состояния, когда поиск вообще не запускается. Сертификат настоящий
-      // и ожидаемый для этого сайта — просто не в дефолтном доверенном списке.
-      ignoreHTTPSErrors: true,
-      ...(PROXY ? { proxy: PROXY } : {}),
-    });
-
-    await context.route('**/*', (route, req) => {
-      if (AD_DOMAINS.test(req.url()) || BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
-        // Явный код ошибки — иначе Playwright/Chromium помечает abort() как
-        // net::ERR_FAILED, неотличимый в логах requestfailed от настоящего
-        // сетевого сбоя через прокси.
-        return route.abort('blockedbyclient');
+  function attachListener(page) {
+    // Считаем вообще все запросы (не только /next/api/task) — если их за 18с+
+    // открытия страницы единицы, значит зависает что-то на самом раннем этапе
+    // (DNS/TLS через туннель), а не сама логика поиска на странице.
+    page.on('request', req => {
+      totalRequests++;
+      const url = req.url();
+      if (!url.includes('/api/')) return;
+      apiRequests++;
+      lastActivityAt = Date.now();
+      if (!url.includes('/next/api/task')) return;
+      taskRequestsSent++;
+      // Их сотни за один поиск (сайт опрашивает статус задач) — логируем
+      // только первый факт, чтобы подтвердить, что поиск вообще стартовал,
+      // а не заваливать лог сотнями одинаковых строк.
+      if (!firstTaskRequestLogged) {
+        firstTaskRequestLogged = true;
+        console.log(`[checker] первый запрос к API поиска: ${url.slice(0, 150)}`);
       }
-      return route.continue();
     });
 
-    let offers = [];
-    // Раньше сбрасывалось только ответами /next/api/task — из-за этого на
-    // медленном окружении (прокси + ограниченный CPU на Render) таймер тишины
-    // истекал ДО того, как страница вообще успевала отправить первый запрос
-    // поиска (на это у неё уходило больше времени, чем IDLE_MS). Теперь считаем
-    // живой любую активность к /api/ — сайт всё это время реально работает,
-    // просто медленно, а не "завис".
-    let lastActivityAt = Date.now();
-    // Диагностика: сколько всего ответов /next/api/task пришло за попытку и
-    // сколько из них были status:"ok" — чтобы в логах Render было видно, где
-    // именно затык (прокси вообще не пускает трафик / пускает, но поставщики
-    // не успевают / успевают, но нужного маршрута нет).
-    let taskResponsesSeen = 0;
-    let taskResponsesOk = 0;
-    let requestFailures = 0;
-    let totalRequests = 0;
-    let apiRequests = 0;
-    let taskRequestsSent = 0;
-    let firstTaskRequestLogged = false;
+    page.on('console', msg => {
+      if (msg.type() !== 'error' || msg.text().includes('ERR_BLOCKED_BY_CLIENT')) return;
+      console.log(`[checker] консоль страницы (error): ${msg.text().slice(0, 200)}`);
+    });
+    page.on('response', async resp => {
+      const url = resp.url();
+      if (!url.includes('/next/api/task')) return;
+      taskResponsesSeen++;
+      let data;
+      try {
+        const buf = await resp.body();
+        data = JSON.parse(buf.toString('utf8'));
+      } catch (e) {
+        console.log(`[checker] не удалось разобрать ответ /next/api/task: ${e.message}`);
+        return;
+      }
+      lastActivityAt = Date.now();
+      const tasks = data.tasks && data.tasks.avia;
+      if (!tasks) return;
+      for (const tid in tasks) {
+        const t = tasks[tid];
+        if (t.status !== 'ok' || !t.result) continue;
+        taskResponsesOk++;
+        offers.push(...findOffers(t, TARGET));
+      }
+    });
 
-    function attachListener(page) {
-      // Считаем вообще все запросы (не только /next/api/task) — если их за 18с+
-      // открытия страницы единицы, значит зависает что-то на самом раннем этапе
-      // (DNS/TLS через туннель), а не сама логика поиска на странице.
-      page.on('request', req => {
-        totalRequests++;
-        const url = req.url();
-        if (!url.includes('/api/')) return;
-        apiRequests++;
-        lastActivityAt = Date.now();
-        if (!url.includes('/next/api/task')) return;
-        taskRequestsSent++;
-        // Их сотни за один поиск (сайт опрашивает статус задач) — логируем
-        // только первый факт, чтобы подтвердить, что поиск вообще стартовал,
-        // а не заваливать лог сотнями одинаковых строк.
-        if (!firstTaskRequestLogged) {
-          firstTaskRequestLogged = true;
-          console.log(`[checker] первый запрос к API поиска: ${url.slice(0, 150)}`);
+    // requestfailed срабатывает и на наши же намеренные route.abort() (рекламные
+    // домены/картинки-стили) — их отсекаем по errorText, чтобы не шуметь в логах
+    // тем, что мы сами заблокировали, а не тем, что реально не доехало через прокси.
+    page.on('requestfailed', req => {
+      const failure = req.failure();
+      const errorText = failure ? failure.errorText : 'unknown';
+      // Наши собственные route.abort('blockedbyclient') из context.route() —
+      // не диагностический сигнал, отсекаем по префиксу (реальный текст —
+      // "net::ERR_BLOCKED_BY_CLIENT.Inspector", не точное совпадение).
+      if (errorText.startsWith('net::ERR_BLOCKED_BY_CLIENT') || errorText === 'NS_ERROR_ABORT' || errorText === 'net::ERR_ABORTED') return;
+      requestFailures++;
+      console.log(`[checker] сетевой запрос не удался: ${errorText} — ${req.url().slice(0, 150)}`);
+    });
+
+    page.on('pageerror', err => console.log(`[checker] JS-ошибка на странице: ${err.message}`));
+  }
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    offers = [];
+    lastError = null;
+    taskResponsesSeen = 0;
+    taskResponsesOk = 0;
+    requestFailures = 0;
+    totalRequests = 0;
+    apiRequests = 0;
+    taskRequestsSent = 0;
+    firstTaskRequestLogged = false;
+    const attemptStartedAt = Date.now();
+    console.log(`[checker] попытка ${attempt}/${MAX_ATTEMPTS}: открываю страницу поиска...`);
+
+    // Свежий браузер целиком на каждую попытку, а не одна долгоживущая
+    // инстанция на все попытки — Chromium не всегда отдаёт память рендерера
+    // между навигациями внутри одного процесса, а на Render (512MB на весь
+    // процесс) это уже приводило к "Ran out of memory". Перезапуск браузера
+    // между попытками — самый надёжный способ реально освободить память
+    // на уровне ОС, а не полагаться на внутренний GC Chromium.
+    const browser = await chromium.launch({ headless: true, args: CHROMIUM_ARGS });
+    try {
+      const context = await browser.newContext({
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        // mincifri.superkassa.ru (и, возможно, другие поддомены сайта) подписаны
+        // российским Minsvyaz/Mintsifry CA ("Russian Trusted Sub CA") — его нет в
+        // доверенном списке Chromium вне России, из-за чего запрос к нему падает
+        // с ERR_CERT_AUTHORITY_INVALID и, похоже, тормозит инициализацию страницы
+        // до состояния, когда поиск вообще не запускается. Сертификат настоящий
+        // и ожидаемый для этого сайта — просто не в дефолтном доверенном списке.
+        ignoreHTTPSErrors: true,
+        ...(PROXY ? { proxy: PROXY } : {}),
+      });
+
+      await context.route('**/*', (route, req) => {
+        if (AD_DOMAINS.test(req.url()) || BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
+          // Явный код ошибки — иначе Playwright/Chromium помечает abort() как
+          // net::ERR_FAILED, неотличимый в логах requestfailed от настоящего
+          // сетевого сбоя через прокси.
+          return route.abort('blockedbyclient');
         }
+        return route.continue();
       });
 
-      page.on('console', msg => {
-        if (msg.type() !== 'error' || msg.text().includes('ERR_BLOCKED_BY_CLIENT')) return;
-        console.log(`[checker] консоль страницы (error): ${msg.text().slice(0, 200)}`);
-      });
-      page.on('response', async resp => {
-        const url = resp.url();
-        if (!url.includes('/next/api/task')) return;
-        taskResponsesSeen++;
-        let data;
-        try {
-          const buf = await resp.body();
-          data = JSON.parse(buf.toString('utf8'));
-        } catch (e) {
-          console.log(`[checker] не удалось разобрать ответ /next/api/task: ${e.message}`);
-          return;
-        }
-        lastActivityAt = Date.now();
-        const tasks = data.tasks && data.tasks.avia;
-        if (!tasks) return;
-        for (const tid in tasks) {
-          const t = tasks[tid];
-          if (t.status !== 'ok' || !t.result) continue;
-          taskResponsesOk++;
-          offers.push(...findOffers(t, TARGET));
-        }
-      });
-
-      // requestfailed срабатывает и на наши же намеренные route.abort() (рекламные
-      // домены/картинки-стили) — их отсекаем по errorText, чтобы не шуметь в логах
-      // тем, что мы сами заблокировали, а не тем, что реально не доехало через прокси.
-      page.on('requestfailed', req => {
-        const failure = req.failure();
-        const errorText = failure ? failure.errorText : 'unknown';
-        // Наши собственные route.abort('blockedbyclient') из context.route() —
-        // не диагностический сигнал, отсекаем по префиксу (реальный текст —
-        // "net::ERR_BLOCKED_BY_CLIENT.Inspector", не точное совпадение).
-        if (errorText.startsWith('net::ERR_BLOCKED_BY_CLIENT') || errorText === 'NS_ERROR_ABORT' || errorText === 'net::ERR_ABORTED') return;
-        requestFailures++;
-        console.log(`[checker] сетевой запрос не удался: ${errorText} — ${req.url().slice(0, 150)}`);
-      });
-
-      page.on('pageerror', err => console.log(`[checker] JS-ошибка на странице: ${err.message}`));
-    }
-
-    let lastError = null;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      offers = [];
-      lastError = null;
-      taskResponsesSeen = 0;
-      taskResponsesOk = 0;
-      requestFailures = 0;
-      totalRequests = 0;
-      apiRequests = 0;
-      taskRequestsSent = 0;
-      firstTaskRequestLogged = false;
-      const attemptStartedAt = Date.now();
-      console.log(`[checker] попытка ${attempt}/${MAX_ATTEMPTS}: открываю страницу поиска...`);
-      // Новая страница на каждую попытку, а не повторный goto на старой —
-      // Chromium не всегда отдаёт память рендерера обратно после навигации
-      // в рамках той же страницы, а тут попытки суммарно могут висеть минутами.
       const page = await context.newPage();
       attachListener(page);
       try {
@@ -216,26 +223,26 @@ async function checkPrice() {
       } finally {
         await page.close().catch(() => {});
       }
-
-      if (offers.length > 0) break;
-      if (attempt < MAX_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+    } finally {
+      await browser.close().catch(() => {});
     }
 
-    if (offers.length === 0) {
-      if (lastError) throw lastError;
-      return { found: false };
-    }
-
-    offers.sort((a, b) => a.total - b.total);
-    return {
-      found: true,
-      price: offers[0].total,
-      currency: offers[0].currency,
-      offersCount: offers.length,
-    };
-  } finally {
-    await browser.close().catch(() => {});
+    if (offers.length > 0) break;
+    if (attempt < MAX_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
   }
+
+  if (offers.length === 0) {
+    if (lastError) throw lastError;
+    return { found: false };
+  }
+
+  offers.sort((a, b) => a.total - b.total);
+  return {
+    found: true,
+    price: offers[0].total,
+    currency: offers[0].currency,
+    offersCount: offers.length,
+  };
 }
 
 module.exports = { checkPrice };
