@@ -12,7 +12,7 @@ const { SocksProxyAgent } = require('socks-proxy-agent');
 
 const LOCAL_SOCKS_PORT = Number(process.env.PROXY_LOCAL_PORT) || 10809;
 const XRAY_BIN = process.env.XRAY_BIN_PATH || path.join(__dirname, '..', 'xray', process.platform === 'win32' ? 'xray.exe' : 'xray');
-const VERIFY_URL = 'https://superkassa.ru/';
+const VERIFY_URLS = ['https://superkassa.ru/'];
 const VERIFY_TIMEOUT_MS = 10000;
 const STARTUP_WAIT_MS = 1500;
 
@@ -130,15 +130,26 @@ async function ensureProxy() {
     const child = spawnXray(configPath);
     await new Promise(r => setTimeout(r, STARTUP_WAIT_MS));
 
-    // Сначала общая связность (внешний нейтральный сайт) — если и она не работает,
-    // проблема в самом туннеле/узле, а не конкретно в superkassa.ru.
-    const generic = await probeThroughLocalProxy('https://api.ipify.org/', 'GET');
-    const target = await probeThroughLocalProxy(VERIFY_URL, 'HEAD');
-    console.log(
-      `[proxy] узел "${label}": общая связность — ${generic.ok ? `ok, ip=${generic.body}, ${generic.ms}мс` : `FAIL (${generic.error || generic.status})`}; superkassa.ru — ${target.ok ? `ok, ${target.ms}мс` : `FAIL (${target.error || target.status})`}`
-    );
+    // До 2 попыток на узел — обрывы соединения ("socket disconnected before
+    // secure TLS...") у этих VPN-нод бывают разовой заминкой, а не системной
+    // проблемой конкретного узла (в отличие от сертификатной ошибки — та
+    // повторяется стабильно и означает, что узел точно не подходит).
+    let allTargetsOk = false;
+    for (let probeAttempt = 1; probeAttempt <= 2 && !allTargetsOk; probeAttempt++) {
+      // Сначала общая связность (внешний нейтральный сайт) — если и она не работает,
+      // проблема в самом туннеле/узле, а не конкретно в superkassa.ru.
+      const generic = await probeThroughLocalProxy('https://api.ipify.org/', 'GET');
+      const targets = [];
+      for (const url of VERIFY_URLS) targets.push({ url, ...(await probeThroughLocalProxy(url, 'HEAD')) });
+      allTargetsOk = targets.every(t => t.ok);
+      console.log(
+        `[proxy] узел "${label}" (попытка ${probeAttempt}/2): общая связность — ${generic.ok ? `ok, ip=${generic.body}, ${generic.ms}мс` : `FAIL (${generic.error || generic.status})`}; ` +
+          targets.map(t => `${t.url} — ${t.ok ? `ok, ${t.ms}мс` : `FAIL (${t.error || t.status})`}`).join('; ')
+      );
+      if (!allTargetsOk && probeAttempt < 2) await new Promise(r => setTimeout(r, 2000));
+    }
 
-    if (target.ok) {
+    if (allTargetsOk) {
       console.log(`[proxy] узел "${label}" рабочий, использую как прокси`);
       process.env.PROXY_SERVER = `socks5://127.0.0.1:${LOCAL_SOCKS_PORT}`;
       return;

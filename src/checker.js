@@ -55,6 +55,13 @@ async function checkPrice() {
     const context = await browser.newContext({
       userAgent:
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      // mincifri.superkassa.ru (и, возможно, другие поддомены сайта) подписаны
+      // российским Minsvyaz/Mintsifry CA ("Russian Trusted Sub CA") — его нет в
+      // доверенном списке Chromium вне России, из-за чего запрос к нему падает
+      // с ERR_CERT_AUTHORITY_INVALID и, похоже, тормозит инициализацию страницы
+      // до состояния, когда поиск вообще не запускается. Сертификат настоящий
+      // и ожидаемый для этого сайта — просто не в дефолтном доверенном списке.
+      ignoreHTTPSErrors: true,
       ...(PROXY ? { proxy: PROXY } : {}),
     });
 
