@@ -73,8 +73,10 @@ const CHROMIUM_ARGS = [
   '--disable-features=site-per-process',
 ];
 
-async function checkPrice() {
-  console.log(`[checker] прокси: ${PROXY ? PROXY.server : 'нет, соединение напрямую'}`);
+// searchUrl — по умолчанию основная дата (config.SEARCH_URL); /check24
+// передаёт config.SEARCH_URL_DEC24, но вся остальная логика — та же самая.
+async function checkPrice(searchUrl = SEARCH_URL) {
+  console.log(`[checker] прокси: ${PROXY ? PROXY.server : 'нет, соединение напрямую'}, URL: ${searchUrl}`);
 
   let offers = [];
   // Раньше сбрасывалось только ответами /next/api/task — из-за этого на
@@ -245,7 +247,7 @@ async function checkPrice() {
         // 60с вместо 30 — на Render через прокси открытие страницы стабильно
         // занимает 18-20с (против 1-2с локально), 30с не давали запаса на случай
         // просадки.
-        await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         console.log(
           `[checker] попытка ${attempt}: страница открылась за ${Date.now() - attemptStartedAt}мс (запросов сделано к этому моменту: ${totalRequests}), жду данные...`
         );

@@ -231,7 +231,9 @@ async function step(name, fn) {
   }
 }
 
-async function attemptBooking(chatId, onProgress = () => {}) {
+// searchUrl — по умолчанию основная дата (config.SEARCH_URL); при бронировании
+// по /check24 передаётся config.SEARCH_URL_DEC24, остальной сценарий не меняется.
+async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_URL) {
   // Свежее чтение на каждый запуск — так изменения через /setup в Telegram
   // подхватываются без перезапуска процесса. chatId — чей именно профиль бронируем.
   const PASSENGER = await getPassenger(chatId);
@@ -329,7 +331,7 @@ async function attemptBooking(chatId, onProgress = () => {}) {
       // маршрута — та же нестабильность выдачи, что чинили в checker.js.
       for (let attempt = 1; attempt <= SEARCH_MAX_ATTEMPTS; attempt++) {
         matchedOffers = [];
-        await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         lastSearchResponseAt = Date.now();
         const deadline = Date.now() + SEARCH_MAX_WAIT_MS;
         while (Date.now() < deadline && Date.now() - lastSearchResponseAt < SEARCH_IDLE_MS) {

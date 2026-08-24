@@ -1,4 +1,4 @@
-const { TARGET, TELEGRAM_CHAT_ID } = require('./config');
+const { TARGET, TELEGRAM_CHAT_ID, SEARCH_URL, SEARCH_URL_DEC24 } = require('./config');
 const { checkPrice } = require('./checker');
 const { attemptBooking, formatOrderCaption } = require('./booker');
 const { sendMessage, sendPhoto, listenForMessages } = require('./telegram');
@@ -15,13 +15,19 @@ http.createServer((req, res) => {
 }).listen(PORT, () => console.log(`Health-check сервер слушает порт ${PORT}`));
 
 let checking = false;
-// Chat id тех, кто написал /check, пока уже шла чужая проверка — им нужно
-// продублировать итоговый ответ, а не оставлять их без ответа вовсе.
+// Метка даты, которая сейчас проверяется ('' — основной /check, иначе,
+// напр., '24 декабря' — /check24) — нужна, чтобы не продублировать ответ
+// про ЧУЖУЮ дату тому, кто ждал ответа про свою (см. respond ниже).
+let inProgressLabel = null;
+// Chat id тех, кто написал ту же команду, пока уже шла чужая проверка —
+// им нужно продублировать итоговый ответ, а не оставлять их без ответа вовсе.
 let waitingChatIds = [];
 
 // Бронирует по очереди на каждого, у кого готов профиль и кто ещё не бронировал.
-// Каждому — своя попытка и свой алерт, в его личный чат.
-async function bookForAllUsers(price, currency) {
+// Каждому — своя попытка и свой алерт, в его личный чат. searchUrl/label —
+// см. runCheck ниже: /check24 бронирует по своей дате той же логикой.
+async function bookForAllUsers(price, currency, searchUrl = SEARCH_URL, label = '') {
+  const prefix = label ? `[${label}] ` : '';
   for (const chatId of profile.allowedChatIds()) {
     if (!(await profile.isProfileComplete(chatId))) {
       console.log(`[booking] у ${chatId} не заполнен профиль — пропускаю`);
@@ -32,58 +38,71 @@ async function bookForAllUsers(price, currency) {
       continue;
     }
 
-    await sendMessage(chatId, `Цена подходит: ${price} ${currency}. Пробую оформить бронь...`);
+    await sendMessage(chatId, `${prefix}Цена подходит: ${price} ${currency}. Пробую оформить бронь...`);
     try {
-      const booking = await attemptBooking(chatId, stage => console.log(`[booking:${chatId}] этап: ${stage}`));
+      const booking = await attemptBooking(chatId, stage => console.log(`[booking:${chatId}] этап: ${stage}`), searchUrl);
       await profile.markBooked(chatId, { at: new Date().toISOString(), price });
       const caption = formatOrderCaption(booking.summary, [
         '',
         `Ссылка на оплату: ${booking.paymentLink}`,
         'Оплати вручную в течение отведённого времени.',
       ]);
-      await sendPhoto(chatId, booking.screenshot, caption);
+      await sendPhoto(chatId, booking.screenshot, prefix + caption);
     } catch (e) {
       console.error(`[booking:${chatId}] не удалось:`, e);
-      await sendMessage(chatId, `Цена была подходящей (${price} ₽), но бронирование не завершилось: ${e.message}\nПроверь вручную, пока цена не ушла.`);
+      await sendMessage(chatId, `${prefix}Цена была подходящей (${price} ₽), но бронирование не завершилось: ${e.message}\nПроверь вручную, пока цена не ушла.`);
     }
   }
 }
 
-// Проверка запускается только вручную через /check — никакого фонового
+// Проверка запускается только вручную через /check(24) — никакого фонового
 // расписания нет (сознательно: регулярный трафик по таймеру — заметный
 // паттерн для антибот-систем сайта, разовые запросы по команде человека
-// выглядят органичнее).
-async function runCheck(requesterChatId) {
+// выглядят органичнее). searchUrl/label по умолчанию — основная дата
+// (config.SEARCH_URL, без пометки); /check24 передаёт SEARCH_URL_DEC24 и
+// метку '24 декабря' — та же самая логика поиска и бронирования, просто
+// другой URL. checking — общий лок на обе даты сразу: два одновременных
+// сеанса Chromium+прокси на 512MB Render гарантированно упрутся в память.
+async function runCheck(requesterChatId, searchUrl = SEARCH_URL, label = '') {
   if (checking) {
-    if (!waitingChatIds.includes(requesterChatId)) waitingChatIds.push(requesterChatId);
-    console.log(`проверка уже идёт, ставлю ${requesterChatId} в очередь на ответ`);
-    await sendMessage(requesterChatId, 'Запрос уже обрабатывается — его отправил другой пользователь. Как только придёт ответ, пришлю его и тебе.');
+    if (label === inProgressLabel) {
+      if (!waitingChatIds.includes(requesterChatId)) waitingChatIds.push(requesterChatId);
+      console.log(`проверка уже идёт, ставлю ${requesterChatId} в очередь на ответ`);
+      await sendMessage(requesterChatId, 'Запрос уже обрабатывается — его отправил другой пользователь. Как только придёт ответ, пришлю его и тебе.');
+    } else {
+      // Другая дата уже в работе — дублировать её ответ этому пользователю
+      // нельзя, он спрашивал про другое. Просто просим подождать и повторить.
+      console.log(`идёт проверка другой даты, ${requesterChatId} просит "${label || 'основную'}" — прошу подождать`);
+      await sendMessage(requesterChatId, 'Сейчас уже идёт проверка другой даты. Подожди немного и повтори запрос.');
+    }
     return;
   }
   checking = true;
+  inProgressLabel = label;
   const startedAt = Date.now();
-  // Итоговый ответ уходит тому, кто запросил проверку, всем, кто написал
-  // /check, пока она уже шла (иначе они бы остались без результата вовсе),
-  // и владельцу — он получает пуш с результатом каждой проверки. Set убирает
-  // дубли, если владелец сам оказался среди инициатора/ожидающих.
+  const prefix = label ? `[${label}] ` : '';
+  // Итоговый ответ уходит тому, кто запросил проверку, всем, кто написал ту
+  // же команду, пока она уже шла (иначе они бы остались без результата
+  // вовсе), и владельцу — он получает пуш с результатом каждой проверки.
+  // Set убирает дубли, если владелец сам оказался среди инициатора/ожидающих.
   const respond = async text => {
     const recipients = new Set([requesterChatId, ...waitingChatIds, TELEGRAM_CHAT_ID]);
     waitingChatIds = [];
-    await Promise.all([...recipients].map(id => sendMessage(id, text)));
+    await Promise.all([...recipients].map(id => sendMessage(id, prefix + text)));
   };
   try {
     const threshold = await profile.getPriceThreshold();
-    console.log('запускаю проверку цены...');
-    const result = await checkPrice();
+    console.log(`${prefix}запускаю проверку цены...`);
+    const result = await checkPrice(searchUrl);
     const ms = Date.now() - startedAt;
 
     if (!result.found) {
-      console.log(`целевой рейс/тариф не найден в выдаче (${ms}мс)`);
+      console.log(`${prefix}целевой рейс/тариф не найден в выдаче (${ms}мс)`);
       await respond('Целевой рейс не найден в текущей выдаче. Возможно, сайт изменился или рейса нет в продаже.');
       return;
     }
 
-    console.log(`цена: ${result.price} ${result.currency}, вариантов найдено: ${result.offersCount} (${ms}мс)`);
+    console.log(`${prefix}цена: ${result.price} ${result.currency}, вариантов найдено: ${result.offersCount} (${ms}мс)`);
 
     if (result.price > threshold) {
       await respond(`Текущая цена: ${result.price} ${result.currency} (порог ${threshold} ₽, ещё не достигнут)`);
@@ -92,13 +111,14 @@ async function runCheck(requesterChatId) {
 
     await respond(`Цена подходящая: ${result.price} ${result.currency} (порог ${threshold} ₽) — запускаю бронирование.`);
 
-    console.log(`цена ${result.price} ₽ ≤ порога — бронирую на всех, у кого готов профиль...`);
-    await bookForAllUsers(result.price, result.currency);
+    console.log(`${prefix}цена ${result.price} ₽ ≤ порога — бронирую на всех, у кого готов профиль...`);
+    await bookForAllUsers(result.price, result.currency, searchUrl, label);
   } catch (e) {
-    console.error('ошибка проверки:', e);
+    console.error(`${prefix}ошибка проверки:`, e);
     await respond(`Ошибка при проверке цены: ${e.message}`);
   } finally {
     checking = false;
+    inProgressLabel = null;
   }
 }
 
@@ -132,7 +152,8 @@ async function showInfo(chatId) {
     [
       'Доступные команды:',
       '',
-      '/check — проверка цены прямо сейчас',
+      '/check — проверка цены прямо сейчас (вылет 25 декабря)',
+      '/check24 — та же проверка, но на вылет 24 декабря',
       '/settings — рейс и порог цены',
       '/profile — посмотреть свои сохранённые данные пассажира и контакты',
       '/setup — пошагово задать/изменить свои данные пассажира и контакты',
@@ -159,6 +180,7 @@ async function showSettings(chatId) {
       `Рейс туда: ${formatTargetLeg(TARGET.outbound)}`,
       `Рейс обратно: ${formatTargetLeg(TARGET.inbound)}`,
       '(маршрут зафиксирован в коде, меняется только через config.js)',
+      '/check — вылет 25 декабря, /check24 — тот же рейс на 24 декабря',
       '',
       `Порог цены: ${threshold} ₽`,
       profile.isOwner(chatId) ? '\nИзменить порог: /threshold <сумма>' : '',
@@ -184,6 +206,7 @@ listenForMessages(async (chatId, text) => {
 
   if (text === '/info' || text === '/start') return showInfo(chatId);
   if (text === '/check') return runCheck(chatId);
+  if (text === '/check24') return runCheck(chatId, SEARCH_URL_DEC24, '24 декабря');
   if (text === '/setup') return wizard.start(chatId);
   if (text === '/profile') return showProfile(chatId);
   if (text === '/settings') return showSettings(chatId);

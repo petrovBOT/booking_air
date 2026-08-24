@@ -12,6 +12,10 @@ module.exports = {
   // ?search=...&refSearch=true запускает свежий поиск сразу при заходе,
   // без этого сайт просто предзаполняет форму и ждёт клика.
   SEARCH_URL: 'https://superkassa.ru/?search=LED2512HKT1601100&refSearch=true',
+  // Тот же рейс и та же логика поиска/бронирования — вылет на день раньше
+  // (24 декабря вместо 25). Отдельная команда /check24 запускает проверку
+  // именно по этой дате, не трогая основной /check.
+  SEARCH_URL_DEC24: 'https://superkassa.ru/?search=LED2412HKT1601100&refSearch=true',
 
   // Рекламные попандеры/трекеры — блокируем на уровне сети, иначе редиректит с сайта.
   AD_DOMAINS: /ostrovok\.ru|fastrovok\.net|dengage\.com/,
