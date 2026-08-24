@@ -2,17 +2,41 @@ const { chromium } = require('playwright');
 const { SEARCH_URL, AD_DOMAINS, TARGET, PROXY } = require('./config');
 const { findOffers } = require('./matcher');
 const { CHROMIUM_ARGS } = require('./chromium-args');
-const { logMemory, logCgroupPulse } = require('./memlog');
-
-// Разовая проверка при старте процесса: New Headless Mode (текущий Chrome по
-// умолчанию под --headless) заметно тяжелее по памяти, чем облегчённый
-// chromium-headless-shell, который мы ставим в Dockerfile — Google из-за
-// этого и выделили headless-shell отдельным бинарником. Playwright ДОЛЖЕН
-// подхватить его автоматически, раз только он и установлен, но это
-// предположение — пусть путь будет виден в логах, а не угадывается.
-console.log(`[checker] исполняемый файл Chromium: ${chromium.executablePath()}`);
+const { logMemory, logCgroupPulse, readCgroupMemory } = require('./memlog');
 
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet']);
+
+// New Headless Mode (текущий Chrome по умолчанию под --headless) заметно
+// тяжелее по памяти, чем облегчённый chromium-headless-shell, который мы
+// ставим в Dockerfile — Google из-за этого и выделили headless-shell
+// отдельным бинарником. chromium.executablePath() тут не помощник — это
+// статический шаблон пути ("chromium-.../chrome"), который Playwright
+// возвращает независимо от того, что реально подставит launch({headless})
+// внутри себя. Единственный надёжный способ проверить — прочитать реальный
+// argv запущенного процесса из /proc (не через `ps`, которого в node:20-slim
+// может не быть). Заодно видно, долетают ли до рендерера наши --js-flags.
+// Один раз за всё время жизни процесса — не на каждую попытку.
+let chromiumProcessesLogged = false;
+function logChromiumProcessesOnce() {
+  if (chromiumProcessesLogged) return;
+  chromiumProcessesLogged = true;
+  try {
+    const fs = require('fs');
+    const pids = fs.readdirSync('/proc').filter(p => /^\d+$/.test(p));
+    const matches = [];
+    for (const pid of pids) {
+      try {
+        const argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean).join(' ');
+        if (/chrom|headless/i.test(argv)) matches.push(`  pid=${pid}: ${argv}`);
+      } catch {
+        // Процесс уже завершился между readdirSync и чтением его cmdline — не наш случай.
+      }
+    }
+    console.log(`[checker] процессы Chromium в контейнере (/proc):\n${matches.join('\n') || '  (не найдено)'}`);
+  } catch (e) {
+    console.log(`[checker] не удалось прочитать /proc для диагностики Chromium: ${e.message}`);
+  }
+}
 
 // Чистая телеметрия сайта (debug-log шлётся десятками в секунду, heartbeat и
 // client-reach — просто пинги) — для самой цены не нужны, а на медленном
@@ -57,6 +81,21 @@ const FIRST_MATCH_GRACE_MS = 5000;
 // нагрузка на память за один вызов.
 const MAX_ATTEMPTS = 2;
 const RETRY_DELAY_MS = 15000;
+
+// Circuit breaker: пока браузер активен (одна попытка = один процесс
+// Chromium, честно перезапускается на каждую) видели пики cgroup 84-96% от
+// 512MB — один раз доходило и до полного OOM-killa всего процесса (Telegram,
+// health-check, Xray — офлайн до принудительного рестарта Render). Порог
+// 80%: между соседними проверками (см. ниже, раз в 10с) наблюдался скачок
+// до ~90MB (17.5% контейнера) за один интервал — 80% оставляет ~100MB
+// запаса, что покрывает худший наблюдавшийся скачок с приличным зазором.
+// Ниже 80% почти всегда обрывали бы попытки без реальной необходимости.
+// Только для checker.js: каждая попытка тут — свежий browser.launch(), так
+// что обрыв реально даёт чистый сброс памяти на следующей попытке. В
+// booker.js (attemptBooking) повторный поиск идёт на ТОМ ЖЕ браузере без
+// перезапуска — там обрыв не даст того же эффекта, поэтому breaker туда
+// сознательно не добавлен.
+const MEMORY_PRESSURE_RATIO = 0.8;
 
 // searchUrl — по умолчанию основная дата (config.SEARCH_URL); /check24
 // передаёт config.SEARCH_URL_DEC24, но вся остальная логика — та же самая.
@@ -199,6 +238,7 @@ async function checkPrice(searchUrl = SEARCH_URL) {
     completedTaskIds = new Set();
     skippedRedundantResponses = 0;
     bytesParsedThisAttempt = 0;
+    let memoryPressureTriggered = false;
     const attemptStartedAt = Date.now();
     console.log(`[checker] попытка ${attempt}/${MAX_ATTEMPTS}: открываю страницу поиска...`);
     logMemory(`checkPrice попытка ${attempt}/${MAX_ATTEMPTS}: до запуска браузера`);
@@ -246,6 +286,9 @@ async function checkPrice(searchUrl = SEARCH_URL) {
           `[checker] попытка ${attempt}: страница открылась за ${Date.now() - attemptStartedAt}мс (запросов сделано к этому моменту: ${totalRequests}), жду данные...`
         );
         lastActivityAt = Date.now();
+        // Рендерер к этому моменту уже точно поднят (страница загрузилась) —
+        // самое надёжное место для однократной проверки реального argv.
+        logChromiumProcessesOnce();
 
         const deadline = Date.now() + MAX_WAIT_MS;
         let lastHeartbeatAt = Date.now();
@@ -265,10 +308,20 @@ async function checkPrice(searchUrl = SEARCH_URL) {
             // процессах ОС), а не в замерах "до/после" — по гипотезе, самое
             // вероятное место пика суммарной памяти контейнера.
             logCgroupPulse(`попытка ${attempt}, браузер активен, ${Math.round((Date.now() - attemptStartedAt) / 1000)}с`);
+
+            const cg = readCgroupMemory();
+            if (cg && cg.max && cg.current / cg.max >= MEMORY_PRESSURE_RATIO) {
+              memoryPressureTriggered = true;
+              console.log(
+                `[checker] попытка ${attempt}: контейнер на ${((cg.current / cg.max) * 100).toFixed(1)}% памяти (порог ${MEMORY_PRESSURE_RATIO * 100}%) — обрываю ожидание и закрываю браузер сам, не дожидаясь OOM-killer'а`
+              );
+              break;
+            }
           }
         }
-        const exitReason =
-          Date.now() >= deadline
+        const exitReason = memoryPressureTriggered
+          ? 'память контейнера на пределе — прервал ради стабильности'
+          : Date.now() >= deadline
             ? 'исчерпан потолок ожидания'
             : firstMatchAt !== null && Date.now() - firstMatchAt >= FIRST_MATCH_GRACE_MS
               ? 'целевой рейс найден, дальше не жду'

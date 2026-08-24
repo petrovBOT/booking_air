@@ -101,4 +101,4 @@ function startHeartbeat(intervalMs = 5 * 60 * 1000) {
   setInterval(() => logMemory('heartbeat (простой, без активной проверки)'), intervalMs).unref();
 }
 
-module.exports = { logMemory, logCgroupPulse, startHeartbeat };
+module.exports = { logMemory, logCgroupPulse, startHeartbeat, readCgroupMemory };
