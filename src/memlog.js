@@ -1,25 +1,26 @@
-// Временная диагностика перед решением о переносе checkPrice/attemptBooking в
-// дочерний процесс (см. "Ran out of memory (512MB)" — падения через раз после
-// нескольких проверок подряд наводят на мысль, что RSS одного вечно живущего
-// Node-процесса растёт по храповику и не возвращается к базовой линии между
-// проверками, а не что течёт конкретно Chromium — он честно перезапускается
-// каждую попытку). Логируем во всех ключевых точках жизненного цикла, чтобы
-// закрыть вопрос фактами с первого прогона, а не гадать по повторным деплоям.
+// Диагностика памяти на Render free (512MB на весь контейнер: Node + Xray +
+// 4 процесса Chromium).
 //
 // Без --expose-gc heapUsed/heapTotal показывают память ДО того, как V8 успел
 // собрать мусор, и создают ложное впечатление роста там, где реально просто
 // GC ещё не сработал — поэтому принудительно чистим кучу перед каждым
 // замером (когда флаг передан), чтобы числа отражали "живые" данные, а не
-// мусор в ожидании сборки. rss при этом всё равно может не совпадать с
-// heapUsed+external — это ожидаемо: rss включает память самого Node-рантайма
-// и то, что аллокатор ОС ещё не вернул системе даже после gc().
+// мусор в ожидании сборки.
 //
-// ВАЖНО: process.memoryUsage() видит только сам Node-процесс. Chromium
-// (browser + renderer) и Xray — отдельные процессы ОС, их память сюда не
-// попадает вообще, а лимит Render в 512MB — это cgroup-лимит на ВЕСЬ
-// контейнер (сумма всех процессов). Поэтому каждый замер дополнительно
-// читает cgroup напрямую из /sys/fs/cgroup — это и есть то самое число,
-// с которым сравнивает OOM-killer, а не косвенная оценка через один Node.
+// process.memoryUsage() видит только сам Node-процесс. Chromium (browser,
+// gpu-process, network service, renderer — по логам /proc их четыре) и Xray
+// живут отдельными процессами ОС, их память сюда не попадает вообще, а лимит
+// Render — cgroup-лимит на ВЕСЬ контейнер. Поэтому дополнительно читаем cgroup.
+//
+// КЛЮЧЕВОЕ: memory.current — НЕ показатель риска OOM. Он включает page cache
+// (mmap'нутый бинарник Chromium ~200MB, файлы профиля в /tmp и т.п.), который
+// ядро под давлением просто вытесняет. Контейнер с hard-лимитом штатно
+// заполняет его кэшем под самый потолок и живёт дальше. Наблюдали ровно это:
+// memory.current=100% при НУЛЕ обработанных ответов и 0.0MB распарсенного
+// JSON — занимать столько анонимной памяти там было просто нечем.
+// К OOM-kill приводит невытесняемая память: anon (кучи процессов), shmem
+// (tmpfs — без свопа не вытесняется), неперемещаемый slab, стеки ядра, сокеты.
+// Её и считаем отдельно — это единственное честное основание для решений.
 const fs = require('fs');
 
 const startedAt = Date.now();
@@ -34,27 +35,73 @@ function fmtDelta(value) {
   return `${value >= 0 ? '+' : ''}${value.toFixed(1)}`;
 }
 
+function parseKeyValue(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const [key, value] = line.trim().split(/\s+/);
+    if (key && value !== undefined) out[key] = Number(value);
+  }
+  return out;
+}
+
+function sumDefined(...values) {
+  return values.reduce((acc, v) => acc + (Number.isFinite(v) ? v : 0), 0);
+}
+
 function readCgroupMemory() {
   try {
     const current = Number(fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim());
     const maxRaw = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
-    return { version: 'v2', current, max: maxRaw === 'max' ? null : Number(maxRaw) };
+    const stat = parseKeyValue(fs.readFileSync('/sys/fs/cgroup/memory.stat', 'utf8'));
+    const events = parseKeyValue(fs.readFileSync('/sys/fs/cgroup/memory.events', 'utf8'));
+    return {
+      version: 'v2',
+      current,
+      max: maxRaw === 'max' ? null : Number(maxRaw),
+      // Всё, что ядро НЕ может просто отбросить, освобождая место.
+      unreclaimable: sumDefined(stat.anon, stat.shmem, stat.slab_unreclaimable, stat.kernel_stack, stat.sock),
+      anon: stat.anon,
+      // Вытесняемый файловый кэш — тот самый, что и раздувал memory.current.
+      file: stat.file,
+      // Ground truth от самого ядра, а не наши догадки по процентам:
+      // max растёт каждый раз, когда аллокация упёрлась в лимит и ядру
+      // пришлось принудительно освобождать; oom_kill — сколько процессов
+      // ядро реально убило за жизнь контейнера.
+      pressureEvents: events.max,
+      oomKills: events.oom_kill,
+    };
   } catch {}
   try {
+    const stat = parseKeyValue(fs.readFileSync('/sys/fs/cgroup/memory/memory.stat', 'utf8'));
     const current = Number(fs.readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim());
     const maxRaw = Number(fs.readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim());
-    // "Лимита нет" в cgroup v1 отображается гигантским числом (обычно 2^63-ish), а не 'max' как в v2.
-    return { version: 'v1', current, max: maxRaw > Number.MAX_SAFE_INTEGER / 2 ? null : maxRaw };
+    return {
+      version: 'v1',
+      current,
+      // "Лимита нет" в cgroup v1 отображается гигантским числом, а не 'max' как в v2.
+      max: maxRaw > Number.MAX_SAFE_INTEGER / 2 ? null : maxRaw,
+      unreclaimable: sumDefined(stat.total_rss, stat.total_shmem),
+      anon: stat.total_rss,
+      file: stat.total_cache,
+      pressureEvents: Number(fs.readFileSync('/sys/fs/cgroup/memory/memory.failcnt', 'utf8').trim()),
+      oomKills: null,
+    };
   } catch {}
   return null;
 }
 
 function fmtCgroup(cg) {
   if (!cg) return ' | cgroup: недоступен (не Linux-контейнер?)';
-  const currentMb = mb(cg.current);
-  if (cg.max == null) return ` | cgroup(${cg.version}): ${currentMb}MB / без лимита`;
-  const pct = Math.round((cg.current / cg.max) * 1000) / 10;
-  return ` | cgroup(${cg.version}): ${currentMb}MB / ${mb(cg.max)}MB (${pct}%)`;
+  const pct = value => (cg.max ? ` (${((value / cg.max) * 100).toFixed(1)}%)` : '');
+  const parts = [
+    // Первым — то, по чему реально принимаются решения.
+    `невытесняемая ${mb(cg.unreclaimable)}MB${pct(cg.unreclaimable)}`,
+    `кэш ${mb(cg.file)}MB (ядро вытеснит)`,
+    `всего ${mb(cg.current)}MB${cg.max ? `/${mb(cg.max)}MB${pct(cg.current)}` : ''}`,
+    `упирались в лимит: ${cg.pressureEvents}`,
+  ];
+  if (cg.oomKills != null) parts.push(`oom-kill: ${cg.oomKills}`);
+  return ` | cgroup(${cg.version}): ${parts.join(', ')}`;
 }
 
 function logMemory(label) {
@@ -84,11 +131,8 @@ function logMemory(label) {
 }
 
 // Лёгкий "пульс" контейнера — без forced gc() и без process.memoryUsage(),
-// только чтение cgroup (два синхронных чтения файла). Предназначен для вызова
-// прямо ВНУТРИ цикла ожидания ответа сайта (пока браузер жив и активно
-// работает, 50-60с+ по логам) — именно там, по гипотезе, находится пик
-// суммарной памяти контейнера (Chromium+Xray+Node вместе), а не в точках
-// "до/после браузера", которые его не захватывают.
+// только чтение cgroup. Предназначен для вызова прямо ВНУТРИ цикла ожидания
+// ответа сайта (пока браузер жив и активно работает, 50-60с+ по логам).
 function logCgroupPulse(label) {
   console.log(`[memory:pulse] ${label}${fmtCgroup(readCgroupMemory())}`);
 }

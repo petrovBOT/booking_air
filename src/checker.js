@@ -82,20 +82,25 @@ const FIRST_MATCH_GRACE_MS = 5000;
 const MAX_ATTEMPTS = 2;
 const RETRY_DELAY_MS = 15000;
 
-// Circuit breaker: пока браузер активен (одна попытка = один процесс
-// Chromium, честно перезапускается на каждую) видели пики cgroup 84-96% от
-// 512MB — один раз доходило и до полного OOM-killa всего процесса (Telegram,
-// health-check, Xray — офлайн до принудительного рестарта Render). Порог
-// 80%: между соседними проверками (см. ниже, раз в 10с) наблюдался скачок
-// до ~90MB (17.5% контейнера) за один интервал — 80% оставляет ~100MB
-// запаса, что покрывает худший наблюдавшийся скачок с приличным зазором.
-// Ниже 80% почти всегда обрывали бы попытки без реальной необходимости.
+// Circuit breaker на случай реального приближения к OOM: закрыть браузер
+// самим (это штатный путь — попытка считается неудачной, дальше retry со
+// свежим браузером) лучше, чем дать ядру убить весь процесс вместе с
+// Telegram-поллингом, health-check и Xray.
+//
+// Считаем ТОЛЬКО невытесняемую память (см. memlog.js). Первая версия
+// сравнивала с лимитом memory.current — и срывала попытки на "100%" при
+// нуле обработанных ответов: там был page cache (бинарник Chromium ~200MB
+// плюс файлы профиля), который ядро вытесняет само, а не повод для паники.
+// Порог по невытесняемой памяти: 85% — ядро начинает агрессивно жать
+// задолго до 100%, а нам нужен зазор на скачок между 10-секундными
+// проверками.
+//
 // Только для checker.js: каждая попытка тут — свежий browser.launch(), так
 // что обрыв реально даёт чистый сброс памяти на следующей попытке. В
 // booker.js (attemptBooking) повторный поиск идёт на ТОМ ЖЕ браузере без
 // перезапуска — там обрыв не даст того же эффекта, поэтому breaker туда
 // сознательно не добавлен.
-const MEMORY_PRESSURE_RATIO = 0.8;
+const MEMORY_PRESSURE_RATIO = 0.85;
 
 // searchUrl — по умолчанию основная дата (config.SEARCH_URL); /check24
 // передаёт config.SEARCH_URL_DEC24, но вся остальная логика — та же самая.
@@ -310,10 +315,10 @@ async function checkPrice(searchUrl = SEARCH_URL) {
             logCgroupPulse(`попытка ${attempt}, браузер активен, ${Math.round((Date.now() - attemptStartedAt) / 1000)}с`);
 
             const cg = readCgroupMemory();
-            if (cg && cg.max && cg.current / cg.max >= MEMORY_PRESSURE_RATIO) {
+            if (cg && cg.max && cg.unreclaimable / cg.max >= MEMORY_PRESSURE_RATIO) {
               memoryPressureTriggered = true;
               console.log(
-                `[checker] попытка ${attempt}: контейнер на ${((cg.current / cg.max) * 100).toFixed(1)}% памяти (порог ${MEMORY_PRESSURE_RATIO * 100}%) — обрываю ожидание и закрываю браузер сам, не дожидаясь OOM-killer'а`
+                `[checker] попытка ${attempt}: невытесняемая память ${((cg.unreclaimable / cg.max) * 100).toFixed(1)}% от лимита (порог ${MEMORY_PRESSURE_RATIO * 100}%) — обрываю ожидание и закрываю браузер сам, не дожидаясь OOM-killer'а`
               );
               break;
             }
