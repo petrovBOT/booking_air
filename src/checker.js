@@ -10,7 +10,12 @@ const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet'])
 // не укладывался, бот репортил цену вдвое-втрое выше реальной. Теперь ждём,
 // пока поток ответов /next/api/task не затихнет (сайт сам перестаёт поллить
 // задачи, включая зависшие), с потолком на случай, если затишья не наступит.
-const IDLE_MS = 10000;
+// IDLE_MS=10000 хватало локально (первый запрос поиска улетает почти сразу
+// после открытия страницы), но на Render через прокси между открытием
+// страницы и первым запросом /next/api/task наблюдался разрыв БЕЗ единого
+// запроса к /api/ вообще — 10с там истекали до того, как поиск успевал
+// стартовать. Подняли с запасом.
+const IDLE_MS = 30000;
 const MAX_WAIT_MS = 120000;
 const POLL_INTERVAL_MS = 500;
 
@@ -76,7 +81,13 @@ async function checkPrice() {
     });
 
     let offers = [];
-    let lastResponseAt = Date.now();
+    // Раньше сбрасывалось только ответами /next/api/task — из-за этого на
+    // медленном окружении (прокси + ограниченный CPU на Render) таймер тишины
+    // истекал ДО того, как страница вообще успевала отправить первый запрос
+    // поиска (на это у неё уходило больше времени, чем IDLE_MS). Теперь считаем
+    // живой любую активность к /api/ — сайт всё это время реально работает,
+    // просто медленно, а не "завис".
+    let lastActivityAt = Date.now();
     // Диагностика: сколько всего ответов /next/api/task пришло за попытку и
     // сколько из них были status:"ok" — чтобы в логах Render было видно, где
     // именно затык (прокси вообще не пускает трафик / пускает, но поставщики
@@ -98,6 +109,7 @@ async function checkPrice() {
         const url = req.url();
         if (!url.includes('/api/')) return;
         apiRequests++;
+        lastActivityAt = Date.now();
         if (!url.includes('/next/api/task')) return;
         taskRequestsSent++;
         // Их сотни за один поиск (сайт опрашивает статус задач) — логируем
@@ -125,7 +137,7 @@ async function checkPrice() {
           console.log(`[checker] не удалось разобрать ответ /next/api/task: ${e.message}`);
           return;
         }
-        lastResponseAt = Date.now();
+        lastActivityAt = Date.now();
         const tasks = data.tasks && data.tasks.avia;
         if (!tasks) return;
         for (const tid in tasks) {
@@ -172,15 +184,18 @@ async function checkPrice() {
       const page = await context.newPage();
       attachListener(page);
       try {
-        await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // 60с вместо 30 — на Render через прокси открытие страницы стабильно
+        // занимает 18-20с (против 1-2с локально), 30с не давали запаса на случай
+        // просадки.
+        await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
         console.log(
           `[checker] попытка ${attempt}: страница открылась за ${Date.now() - attemptStartedAt}мс (запросов сделано к этому моменту: ${totalRequests}), жду данные...`
         );
-        lastResponseAt = Date.now();
+        lastActivityAt = Date.now();
 
         const deadline = Date.now() + MAX_WAIT_MS;
         let lastHeartbeatAt = Date.now();
-        while (Date.now() < deadline && Date.now() - lastResponseAt < IDLE_MS) {
+        while (Date.now() < deadline && Date.now() - lastActivityAt < IDLE_MS) {
           await page.waitForTimeout(POLL_INTERVAL_MS);
           if (Date.now() - lastHeartbeatAt >= 10000) {
             lastHeartbeatAt = Date.now();
