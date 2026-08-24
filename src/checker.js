@@ -25,6 +25,16 @@ const IDLE_MS = 30000;
 const MAX_WAIT_MS = 120000;
 const POLL_INTERVAL_MS = 500;
 
+// IDLE_MS выше страхует от "поиск ещё толком не начался", но не спасает от
+// обратной ситуации: сайт непрерывно опрашивает поставщиков, которые всё
+// никак не завершатся (или не завершатся вообще), и поток запросов не
+// затихает часами, хотя у нас уже давно стабильный набор предложений. Раз
+// ЦЕНА уже есть и новые поставщики какое-то время не завершаются — новых
+// данных ждать бессмысленно, зато лишний трафик через прокси и память под
+// него продолжают тратиться. Порог короче IDLE_MS: это уже не "подожди, вдруг
+// начнётся", а "хватит, дальше только шум".
+const RESULTS_IDLE_MS = 20000;
+
 // Даже когда все поставщики честно ответили, конкретно нужная пара
 // туда+обратно у них иногда не складывается в единый тариф — при повторном
 // поиске секунды спустя та же связка нередко находится. Поэтому при пустом
@@ -72,6 +82,9 @@ async function checkPrice() {
   // живой любую активность к /api/ — сайт всё это время реально работает,
   // просто медленно, а не "завис".
   let lastActivityAt = Date.now();
+  // Отдельно — момент последнего НОВОГО завершённого поставщика (не просто
+  // любого запроса). См. RESULTS_IDLE_MS выше.
+  let lastNewCompletionAt = Date.now();
   // Диагностика: сколько всего ответов /next/api/task пришло за попытку и
   // сколько из них были status:"ok" — чтобы в логах Render было видно, где
   // именно затык (прокси вообще не пускает трафик / пускает, но поставщики
@@ -83,6 +96,12 @@ async function checkPrice() {
   let apiRequests = 0;
   let taskRequestsSent = 0;
   let firstTaskRequestLogged = false;
+  // status:"ok" — терминальное состояние конкретной задачи поставщика: сайт
+  // продолжает опрашивать тот же __tasks=ID и после этого, но данные там уже
+  // не изменятся. Запоминаем такие id, чтобы не читать и не парсить заново
+  // тело повторного ответа (среди них попадались на несколько мегабайт).
+  let completedTaskIds = new Set();
+  let skippedRedundantResponses = 0;
 
   function attachListener(page) {
     // Считаем вообще все запросы (не только /next/api/task) — если их за 18с+
@@ -118,6 +137,17 @@ async function checkPrice() {
     page.on('response', async resp => {
       const url = resp.url();
       if (!url.includes('/next/api/task')) return;
+
+      // __tasks=ID(,ID...) в самом URL — если все перечисленные задачи уже
+      // видели с status:"ok" в этой же попытке, тело ответа точно не несёт
+      // ничего нового: не читаем и не парсим его вовсе (экономим и память, и CPU
+      // на JSON.parse — среди этих ответов попадались по несколько мегабайт).
+      const requestedIds = (new URL(url).searchParams.get('__tasks') || '').split(',').filter(Boolean);
+      if (requestedIds.length && requestedIds.every(id => completedTaskIds.has(id))) {
+        skippedRedundantResponses++;
+        return;
+      }
+
       taskResponsesSeen++;
       let data;
       try {
@@ -132,7 +162,10 @@ async function checkPrice() {
       if (!tasks) return;
       for (const tid in tasks) {
         const t = tasks[tid];
-        if (t.status !== 'ok' || !t.result) continue;
+        if (t.status !== 'ok' || completedTaskIds.has(tid)) continue;
+        completedTaskIds.add(tid);
+        lastNewCompletionAt = Date.now();
+        if (!t.result) continue;
         taskResponsesOk++;
         offers.push(...findOffers(t, TARGET));
       }
@@ -166,6 +199,8 @@ async function checkPrice() {
     apiRequests = 0;
     taskRequestsSent = 0;
     firstTaskRequestLogged = false;
+    completedTaskIds = new Set();
+    skippedRedundantResponses = 0;
     const attemptStartedAt = Date.now();
     console.log(`[checker] попытка ${attempt}/${MAX_ATTEMPTS}: открываю страницу поиска...`);
 
@@ -212,21 +247,31 @@ async function checkPrice() {
           `[checker] попытка ${attempt}: страница открылась за ${Date.now() - attemptStartedAt}мс (запросов сделано к этому моменту: ${totalRequests}), жду данные...`
         );
         lastActivityAt = Date.now();
+        lastNewCompletionAt = Date.now();
 
         const deadline = Date.now() + MAX_WAIT_MS;
         let lastHeartbeatAt = Date.now();
         while (Date.now() < deadline && Date.now() - lastActivityAt < IDLE_MS) {
           await page.waitForTimeout(POLL_INTERVAL_MS);
+          // Раз что-то уже нашли, но новые поставщики какое-то время не
+          // завершаются — дальше только шум от тех, кто завершится нескоро
+          // (или никогда). Выходим раньше жёсткого потолка/полной тишины.
+          if (offers.length > 0 && Date.now() - lastNewCompletionAt >= RESULTS_IDLE_MS) break;
           if (Date.now() - lastHeartbeatAt >= 10000) {
             lastHeartbeatAt = Date.now();
             console.log(
-              `[checker] попытка ${attempt}: ещё жду (${Math.round((Date.now() - attemptStartedAt) / 1000)}с) — запросов всего: ${totalRequests} (к /api/: ${apiRequests}), запросов /next/api/task отправлено: ${taskRequestsSent}, ответов: ${taskResponsesSeen} (ok: ${taskResponsesOk}), совпадений: ${offers.length}, сбоев запросов: ${requestFailures}`
+              `[checker] попытка ${attempt}: ещё жду (${Math.round((Date.now() - attemptStartedAt) / 1000)}с) — запросов всего: ${totalRequests} (к /api/: ${apiRequests}), запросов /next/api/task отправлено: ${taskRequestsSent}, ответов: ${taskResponsesSeen} (ok: ${taskResponsesOk}, пропущено повторных: ${skippedRedundantResponses}), совпадений: ${offers.length}, сбоев запросов: ${requestFailures}`
             );
           }
         }
-        const exitReason = Date.now() >= deadline ? 'исчерпан потолок ожидания' : 'поток ответов затих';
+        const exitReason =
+          Date.now() >= deadline
+            ? 'исчерпан потолок ожидания'
+            : offers.length > 0 && Date.now() - lastNewCompletionAt >= RESULTS_IDLE_MS
+              ? 'результаты стабильны, новых поставщиков давно нет'
+              : 'поток ответов затих';
         console.log(
-          `[checker] попытка ${attempt}: закончил ждать (${exitReason}) — запросов всего: ${totalRequests} (к /api/: ${apiRequests}), запросов /next/api/task отправлено: ${taskRequestsSent}, ответов: ${taskResponsesSeen} (ok: ${taskResponsesOk}), совпадений с целевым маршрутом: ${offers.length}, сбоев запросов: ${requestFailures}, всего ${Date.now() - attemptStartedAt}мс`
+          `[checker] попытка ${attempt}: закончил ждать (${exitReason}) — запросов всего: ${totalRequests} (к /api/: ${apiRequests}), запросов /next/api/task отправлено: ${taskRequestsSent}, ответов: ${taskResponsesSeen} (ok: ${taskResponsesOk}, пропущено повторных: ${skippedRedundantResponses}), совпадений с целевым маршрутом: ${offers.length}, сбоев запросов: ${requestFailures}, всего ${Date.now() - attemptStartedAt}мс`
         );
       } catch (e) {
         // Сайт иногда просто не открывается за 30с (сетевой сбой/подвисание) —
