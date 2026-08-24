@@ -28,12 +28,14 @@ const POLL_INTERVAL_MS = 500;
 // IDLE_MS выше страхует от "поиск ещё толком не начался", но не спасает от
 // обратной ситуации: сайт непрерывно опрашивает поставщиков, которые всё
 // никак не завершатся (или не завершатся вообще), и поток запросов не
-// затихает часами, хотя у нас уже давно стабильный набор предложений. Раз
-// ЦЕНА уже есть и новые поставщики какое-то время не завершаются — новых
-// данных ждать бессмысленно, зато лишний трафик через прокси и память под
-// него продолжают тратиться. Порог короче IDLE_MS: это уже не "подожди, вдруг
-// начнётся", а "хватит, дальше только шум".
-const RESULTS_IDLE_MS = 20000;
+// затихает часами. А как только наш целевой рейс уже нашёлся у ХОТЯ БЫ
+// одного поставщика — продолжать ждать остальных смысла нет: нам нужен один
+// подходящий по маршруту+рейсу тариф, а не биржа цен по всем авиакомпаниям
+// сразу. Короткое окно ниже — не "остановиться мгновенно", а поймать
+// почти одновременные ответы от других продавцов той же самой брони
+// (нередко приходят кластером в те же секунды), прежде чем сдаться на
+// первом, если рядом есть дешевле тот же рейс.
+const FIRST_MATCH_GRACE_MS = 5000;
 
 // Даже когда все поставщики честно ответили, конкретно нужная пара
 // туда+обратно у них иногда не складывается в единый тариф — при повторном
@@ -82,9 +84,9 @@ async function checkPrice() {
   // живой любую активность к /api/ — сайт всё это время реально работает,
   // просто медленно, а не "завис".
   let lastActivityAt = Date.now();
-  // Отдельно — момент последнего НОВОГО завершённого поставщика (не просто
-  // любого запроса). См. RESULTS_IDLE_MS выше.
-  let lastNewCompletionAt = Date.now();
+  // Момент, когда нашёлся ПЕРВЫЙ подходящий тариф — см. FIRST_MATCH_GRACE_MS.
+  // null, пока ничего не нашли.
+  let firstMatchAt = null;
   // Диагностика: сколько всего ответов /next/api/task пришло за попытку и
   // сколько из них были status:"ok" — чтобы в логах Render было видно, где
   // именно затык (прокси вообще не пускает трафик / пускает, но поставщики
@@ -164,10 +166,10 @@ async function checkPrice() {
         const t = tasks[tid];
         if (t.status !== 'ok' || completedTaskIds.has(tid)) continue;
         completedTaskIds.add(tid);
-        lastNewCompletionAt = Date.now();
         if (!t.result) continue;
         taskResponsesOk++;
         offers.push(...findOffers(t, TARGET));
+        if (firstMatchAt === null && offers.length > 0) firstMatchAt = Date.now();
       }
     });
 
@@ -199,6 +201,7 @@ async function checkPrice() {
     apiRequests = 0;
     taskRequestsSent = 0;
     firstTaskRequestLogged = false;
+    firstMatchAt = null;
     completedTaskIds = new Set();
     skippedRedundantResponses = 0;
     const attemptStartedAt = Date.now();
@@ -247,16 +250,16 @@ async function checkPrice() {
           `[checker] попытка ${attempt}: страница открылась за ${Date.now() - attemptStartedAt}мс (запросов сделано к этому моменту: ${totalRequests}), жду данные...`
         );
         lastActivityAt = Date.now();
-        lastNewCompletionAt = Date.now();
 
         const deadline = Date.now() + MAX_WAIT_MS;
         let lastHeartbeatAt = Date.now();
         while (Date.now() < deadline && Date.now() - lastActivityAt < IDLE_MS) {
           await page.waitForTimeout(POLL_INTERVAL_MS);
-          // Раз что-то уже нашли, но новые поставщики какое-то время не
-          // завершаются — дальше только шум от тех, кто завершится нескоро
-          // (или никогда). Выходим раньше жёсткого потолка/полной тишины.
-          if (offers.length > 0 && Date.now() - lastNewCompletionAt >= RESULTS_IDLE_MS) break;
+          // Целевой рейс уже нашёлся — короткое окно поймать почти
+          // одновременные ответы от других продавцов той же брони, и хватит:
+          // нам нужен один подходящий тариф, а не полная биржа цен по всем
+          // авиакомпаниям сразу.
+          if (firstMatchAt !== null && Date.now() - firstMatchAt >= FIRST_MATCH_GRACE_MS) break;
           if (Date.now() - lastHeartbeatAt >= 10000) {
             lastHeartbeatAt = Date.now();
             console.log(
@@ -267,8 +270,8 @@ async function checkPrice() {
         const exitReason =
           Date.now() >= deadline
             ? 'исчерпан потолок ожидания'
-            : offers.length > 0 && Date.now() - lastNewCompletionAt >= RESULTS_IDLE_MS
-              ? 'результаты стабильны, новых поставщиков давно нет'
+            : firstMatchAt !== null && Date.now() - firstMatchAt >= FIRST_MATCH_GRACE_MS
+              ? 'целевой рейс найден, дальше не жду'
               : 'поток ответов затих';
         console.log(
           `[checker] попытка ${attempt}: закончил ждать (${exitReason}) — запросов всего: ${totalRequests} (к /api/: ${apiRequests}), запросов /next/api/task отправлено: ${taskRequestsSent}, ответов: ${taskResponsesSeen} (ok: ${taskResponsesOk}, пропущено повторных: ${skippedRedundantResponses}), совпадений с целевым маршрутом: ${offers.length}, сбоев запросов: ${requestFailures}, всего ${Date.now() - attemptStartedAt}мс`
