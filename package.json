@@ -2,12 +2,13 @@
   "name": "superkassa-price-watcher",
   "version": "1.0.0",
   "private": true,
-  "main": "src/index.js",
+  "main": "src/start.js",
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node src/start.js",
     "dry-run": "node scripts/dry-run.js"
   },
   "dependencies": {
-    "playwright": "1.62.1"
+    "playwright": "1.62.1",
+    "socks-proxy-agent": "^8.0.5"
   }
 }

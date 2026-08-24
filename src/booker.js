@@ -1,5 +1,5 @@
 const { chromium } = require('playwright');
-const { SEARCH_URL, AD_DOMAINS, TARGET, PAYMENT_METHOD_LABEL, HEADLESS } = require('./config');
+const { SEARCH_URL, AD_DOMAINS, TARGET, PAYMENT_METHOD_LABEL, HEADLESS, PROXY } = require('./config');
 const { getPassenger, getContact } = require('./profile');
 const { findOffers } = require('./matcher');
 
@@ -263,6 +263,7 @@ async function attemptBooking(chatId, onProgress = () => {}) {
       userAgent:
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
       viewport: { width: 1400, height: 1400 },
+      ...(PROXY ? { proxy: PROXY } : {}),
     });
 
     // Блокируем только рекламные домены — картинки/стили нужны, форма интерактивная.

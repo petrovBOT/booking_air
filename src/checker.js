@@ -1,5 +1,5 @@
 const { chromium } = require('playwright');
-const { SEARCH_URL, AD_DOMAINS, TARGET } = require('./config');
+const { SEARCH_URL, AD_DOMAINS, TARGET, PROXY } = require('./config');
 const { findOffers } = require('./matcher');
 
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet']);
@@ -53,6 +53,7 @@ async function checkPrice() {
     const context = await browser.newContext({
       userAgent:
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      ...(PROXY ? { proxy: PROXY } : {}),
     });
 
     await context.route('**/*', (route, req) => {

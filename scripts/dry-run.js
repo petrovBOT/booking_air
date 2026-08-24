@@ -2,22 +2,10 @@
 // но НЕ нажимает "Оплатить" и не закрывает окно — для визуальной проверки перед деплоем.
 // Использование: npm run dry-run [chatId]  (по умолчанию — владелец бота)
 
-const fs = require('fs');
 const path = require('path');
+const { loadEnvFile } = require('../src/load-env');
 
-const envFile = path.join(__dirname, '..', '.env');
-if (fs.existsSync(envFile)) {
-  fs.readFileSync(envFile, 'utf8')
-    .split('\n')
-    .forEach(line => {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) return;
-      const idx = trimmed.indexOf('=');
-      if (idx === -1) return;
-      const key = trimmed.slice(0, idx).trim();
-      if (!(key in process.env)) process.env[key] = trimmed.slice(idx + 1).trim();
-    });
-}
+loadEnvFile();
 process.env.HEADLESS = 'false';
 process.env.DRY_RUN = 'true';
 

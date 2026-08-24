@@ -6,11 +6,8 @@ const PRICE_THRESHOLD_RUB = Number(process.env.PRICE_THRESHOLD_RUB) || 110000;
 module.exports = {
   PRICE_THRESHOLD_RUB,
 
-  // На Koyeb всегда headless. HEADLESS=false — только для локальной проверки глазами.
+  // На Render всегда headless. HEADLESS=false — только для локальной проверки глазами.
   HEADLESS: process.env.HEADLESS !== 'false',
-
-  // Как часто гонять автоматическую проверку (минуты).
-  CHECK_INTERVAL_MINUTES: Number(process.env.CHECK_INTERVAL_MINUTES) || 20,
 
   // ?search=...&refSearch=true запускает свежий поиск сразу при заходе,
   // без этого сайт просто предзаполняет форму и ждёт клика.
@@ -18,6 +15,19 @@ module.exports = {
 
   // Рекламные попандеры/трекеры — блокируем на уровне сети, иначе редиректит с сайта.
   AD_DOMAINS: /ostrovok\.ru|fastrovok\.net|dengage\.com/,
+
+  // Опционально: прокси для запросов к superkassa.ru — на случай, если сайт
+  // притормаживает/блокирует дата-центровые IP хостинга. PROXY_SERVER — в формате,
+  // который ожидает Playwright ("http://host:port" или "socks5://host:port").
+  // PROXY_USERNAME/PROXY_PASSWORD — только если у прокси есть авторизация.
+  // Без PROXY_SERVER бот работает как раньше, напрямую.
+  PROXY: process.env.PROXY_SERVER
+    ? {
+        server: process.env.PROXY_SERVER,
+        username: process.env.PROXY_USERNAME || undefined,
+        password: process.env.PROXY_PASSWORD || undefined,
+      }
+    : null,
 
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   // Владелец бота — единственный, кто может менять порог цены и видит админ-команды.
