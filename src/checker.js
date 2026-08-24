@@ -117,6 +117,7 @@ const RETRY_DELAY_MS = 15000;
 // перезапуска — там обрыв не даст того же эффекта, поэтому breaker туда
 // сознательно не добавлен.
 const MEMORY_PRESSURE_RATIO = 0.85;
+const MEMORY_CHECK_INTERVAL_MS = 2000;
 
 // searchUrl — по умолчанию основная дата (config.SEARCH_URL); /check24
 // передаёт config.SEARCH_URL_DEC24, но вся остальная логика — та же самая.
@@ -313,6 +314,7 @@ async function checkPrice(searchUrl = SEARCH_URL) {
 
         const deadline = Date.now() + MAX_WAIT_MS;
         let lastHeartbeatAt = Date.now();
+        let lastMemoryCheckAt = Date.now();
         while (Date.now() < deadline && Date.now() - lastActivityAt < IDLE_MS) {
           await page.waitForTimeout(POLL_INTERVAL_MS);
           // Целевой рейс уже нашёлся — короткое окно поймать почти
@@ -329,7 +331,15 @@ async function checkPrice(searchUrl = SEARCH_URL) {
             // процессах ОС), а не в замерах "до/после" — по гипотезе, самое
             // вероятное место пика суммарной памяти контейнера.
             logCgroupPulse(`попытка ${attempt}, браузер активен, ${Math.round((Date.now() - attemptStartedAt) / 1000)}с`);
+          }
 
+          // Проверка памяти — отдельно от логирования и заметно чаще (3 чтения
+          // мелких файлов, дёшево). По замерам невытесняемая память растёт до
+          // 7.2MB/с: за 10с это 14% лимита, то есть с порога 85% можно было бы
+          // проскочить сразу на 99% и не успеть среагировать. За 2с прирост
+          // около 3%, и сработавший порог гарантирует запас до потолка.
+          if (Date.now() - lastMemoryCheckAt >= MEMORY_CHECK_INTERVAL_MS) {
+            lastMemoryCheckAt = Date.now();
             const cg = readCgroupMemory();
             if (cg && cg.max && cg.unreclaimable / cg.max >= MEMORY_PRESSURE_RATIO) {
               memoryPressureTriggered = true;

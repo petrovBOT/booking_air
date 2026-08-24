@@ -3,7 +3,7 @@ const { SEARCH_URL, AD_DOMAINS, TARGET, PAYMENT_METHOD_LABEL, HEADLESS, PROXY } 
 const { getPassenger, getContact } = require('./profile');
 const { findOffers } = require('./matcher');
 const { CHROMIUM_ARGS } = require('./chromium-args');
-const { logMemory, logCgroupPulse } = require('./memlog');
+const { logMemory, logCgroupPulse, readCgroupMemory } = require('./memlog');
 
 const URLISH_KEY = /url|link|redirect|href|formurl|paymenturl/i;
 
@@ -18,7 +18,15 @@ const URLISH_KEY = /url|link|redirect|href|formurl|paymenturl/i;
 // (2.4-4.8MB/с там), и ровно такой хвост убивал контейнер. Здесь страница
 // заведомо тяжелее (картинки и стили не блокируются — они нужны для
 // раскладки), так что запас нужен больше, а не меньше: 50с, как в checker.
-const SEARCH_IDLE_MS = 10000;
+// SEARCH_IDLE_MS было 10000 — и /testbook показал, чем это кончается: обе
+// попытки завершались за ~30с с нулём совпадений сразу после того, как
+// checker на том же URL находил 19 предложений. Отсчёт тишины стартует сразу
+// после загрузки страницы, а сайт на Render через прокси отправляет первый
+// запрос /next/api/task лишь через 5-10с после неё, первые же ответы приходят
+// к 40-50-й секунде — десять секунд истекали до того, как поиск вообще
+// начинался. checker ровно на этом стоял и поднял свой IDLE_MS до 30000
+// (см. комментарий там); здесь тот же урок просто не был перенесён.
+const SEARCH_IDLE_MS = 30000;
 const SEARCH_MAX_WAIT_MS = 50000;
 
 // checker.js уже наступал на эти грабли (см. "Повторять поиск при пустом
@@ -29,6 +37,15 @@ const SEARCH_MAX_WAIT_MS = 50000;
 // хрупкая для той же самой нестабильности выдачи.
 const SEARCH_MAX_ATTEMPTS = 2;
 const SEARCH_RETRY_DELAY_MS = 15000;
+
+// Порог выше, чем в checker.js (0.85): там обрыв попытки стоит одного повтора,
+// здесь — несозданной брони, ради которой всё и делается. Но если памяти
+// действительно не хватает, выбор не между "прервать" и "успеть", а между
+// "прервать с внятным сообщением" и "умереть молча": при OOM процесс убивают
+// целиком, человек не получает ничего, а бот уходит в офлайн до перезапуска.
+// Поэтому прерываемся сами и говорим человеку бронировать вручную.
+const BOOKING_MEMORY_ABORT_RATIO = 0.9;
+const MEMORY_CHECK_INTERVAL_MS = 2000;
 
 function findLinkInJson(obj) {
   if (obj == null) return null;
@@ -228,8 +245,22 @@ const PAYMENT_TESTIDS = {
   'Бронирование': 'booking-payment-logo-select-button',
 };
 
+// Бросает, если невытесняемая память подошла к лимиту. Вызывается на границах
+// шагов: сценарий бронирования длинный, и внятная ошибка с указанием этапа
+// куда полезнее, чем внезапная смерть процесса без единого сообщения.
+function assertMemoryOk(where) {
+  const cg = readCgroupMemory();
+  if (!cg || !cg.max) return;
+  const ratio = cg.unreclaimable / cg.max;
+  if (ratio < BOOKING_MEMORY_ABORT_RATIO) return;
+  throw new Error(
+    `памяти контейнера почти не осталось (${(ratio * 100).toFixed(1)}% невытесняемой при пороге ${BOOKING_MEMORY_ABORT_RATIO * 100}%) на этапе "${where}" — прерываю, чтобы не потерять процесс целиком`
+  );
+}
+
 async function step(name, fn) {
   const startedAt = Date.now();
+  assertMemoryOk(`перед шагом "${name}"`);
   try {
     await fn();
     // Замер после каждого шага: сценарий бронирования длинный (перелистывание
@@ -322,6 +353,14 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
       }
     });
 
+    // Активностью считаем и ИСХОДЯЩИЙ запрос поиска, а не только ответ на него —
+    // так же, как в checker.js. Между отправкой запроса и ответом на медленном
+    // прокси проходят десятки секунд: если считать живым только ответ, таймер
+    // тишины истекает посреди нормально идущего поиска.
+    page.on('request', req => {
+      if (req.url().includes('/next/api/task')) lastSearchResponseAt = Date.now();
+    });
+
     page.on('response', async resp => {
       const url = resp.url();
       if (!url.includes('/next/api/task')) return;
@@ -363,6 +402,7 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
           lastSearchResponseAt = Date.now();
           const deadline = Date.now() + SEARCH_MAX_WAIT_MS;
           let lastPulseAt = Date.now();
+          let lastMemoryCheckAt = Date.now();
           while (Date.now() < deadline && Date.now() - lastSearchResponseAt < SEARCH_IDLE_MS) {
             await page.waitForTimeout(500);
             // Досрочный выход по первому совпадению: цена и наличие рейса уже
@@ -374,6 +414,12 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
             if (Date.now() - lastPulseAt >= 10000) {
               lastPulseAt = Date.now();
               logCgroupPulse(`attemptBooking поиск, попытка ${attempt}, ${Math.round((Date.now() - attemptStartedAt) / 1000)}с`);
+            }
+            // Здесь прерваться дёшево: браузер всё равно пересоздаётся на
+            // следующей попытке, а до формы и брони дело ещё не дошло.
+            if (Date.now() - lastMemoryCheckAt >= MEMORY_CHECK_INTERVAL_MS) {
+              lastMemoryCheckAt = Date.now();
+              assertMemoryOk(`поиск, попытка ${attempt}`);
             }
           }
         } catch (e) {
