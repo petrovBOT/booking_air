@@ -4,6 +4,12 @@ const { findOffers } = require('./matcher');
 
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet']);
 
+// Чистая телеметрия сайта (debug-log шлётся десятками в секунду, heartbeat и
+// client-reach — просто пинги) — для самой цены не нужны, а на медленном
+// прокси-соединении на Render каждый лишний запрос — это лишнее время и
+// память. Проверено локально: с блокировкой поиск так же находит рейсы.
+const BLOCKED_API_PATTERNS = [/\/next\/api\/debug-log/, /\/next\/api\/heartbeat/, /\/next\/api\/client-reach/];
+
 // Поставщики отвечают асинхронно и не одновременно: дешёвые (напр. myagent)
 // обычно готовы позже дорогих (travelport и т.п.). Раньше ждали фиксированные
 // 25с и брали минимум из того, что успело прийти — если дешёвый поставщик
@@ -87,8 +93,14 @@ async function checkPrice() {
       const url = req.url();
       if (!url.includes('/api/')) return;
       apiRequests++;
-      lastActivityAt = Date.now();
       if (!url.includes('/next/api/task')) return;
+      // Таймер простоя сбрасываем только реально значимой активностью
+      // (запрос/ответ поиска). Телеметрию (debug-log/heartbeat) блокируем
+      // маршрутизацией, но событие 'request' на неё всё равно срабатывает
+      // ДО блокировки — если бы мы сбрасывали таймер и по ней, он бы никогда
+      // не истекал (сайт долбит эти пинги бесконечно), и ожидание всегда
+      // тянулось бы до жёсткого потолка, даже когда поиск давно закончен.
+      lastActivityAt = Date.now();
       taskRequestsSent++;
       // Их сотни за один поиск (сайт опрашивает статус задач) — логируем
       // только первый факт, чтобы подтвердить, что поиск вообще стартовал,
@@ -179,7 +191,8 @@ async function checkPrice() {
       });
 
       await context.route('**/*', (route, req) => {
-        if (AD_DOMAINS.test(req.url()) || BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
+        const url = req.url();
+        if (AD_DOMAINS.test(url) || BLOCKED_RESOURCE_TYPES.has(req.resourceType()) || BLOCKED_API_PATTERNS.some(p => p.test(url))) {
           // Явный код ошибки — иначе Playwright/Chromium помечает abort() как
           // net::ERR_FAILED, неотличимый в логах requestfailed от настоящего
           // сетевого сбоя через прокси.
