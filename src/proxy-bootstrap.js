@@ -83,15 +83,23 @@ function spawnXray(configPath) {
   return child;
 }
 
-async function verifyProxyWorks() {
+// Возвращает подробности, а не просто true/false — чтобы в логах было видно
+// РАЗНИЦУ между "туннель вообще не работает" и "туннель работает, но конкретно
+// superkassa.ru через этот узел не отвечает/блокирует" — это два разных вывода
+// для диагностики (обрыв VLESS до узла vs. деградация IP именно для сайта).
+function probeThroughLocalProxy(url, method = 'HEAD') {
   const agent = new SocksProxyAgent(`socks5://127.0.0.1:${LOCAL_SOCKS_PORT}`);
+  const startedAt = Date.now();
   return new Promise(resolve => {
-    const req = https.request(VERIFY_URL, { agent, method: 'HEAD', timeout: VERIFY_TIMEOUT_MS }, res => {
-      res.destroy();
-      resolve(res.statusCode < 500);
+    const req = https.request(url, { agent, method, timeout: VERIFY_TIMEOUT_MS }, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        resolve({ ok: res.statusCode < 500, status: res.statusCode, ms: Date.now() - startedAt, body: Buffer.concat(chunks).toString('utf8').slice(0, 100) });
+      });
     });
-    req.on('timeout', () => { req.destroy(); resolve(false); });
-    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout', ms: Date.now() - startedAt }); });
+    req.on('error', e => resolve({ ok: false, error: e.message, ms: Date.now() - startedAt }));
     req.end();
   });
 }
@@ -113,20 +121,30 @@ async function ensureProxy() {
     return;
   }
 
+  console.log(`[proxy] найдено узлов в подписке: ${nodes.length} (${nodes.map(n => n.label || n.address).join(', ')})`);
+
   const configPath = path.join(os.tmpdir(), 'xray-proxy-config.json');
   for (const node of nodes) {
+    const label = node.label || node.address;
     fs.writeFileSync(configPath, JSON.stringify(buildXrayConfig(node)));
     const child = spawnXray(configPath);
     await new Promise(r => setTimeout(r, STARTUP_WAIT_MS));
 
-    const works = await verifyProxyWorks();
-    if (works) {
-      console.log(`[proxy] узел "${node.label || node.address}" рабочий, использую как прокси`);
+    // Сначала общая связность (внешний нейтральный сайт) — если и она не работает,
+    // проблема в самом туннеле/узле, а не конкретно в superkassa.ru.
+    const generic = await probeThroughLocalProxy('https://api.ipify.org/', 'GET');
+    const target = await probeThroughLocalProxy(VERIFY_URL, 'HEAD');
+    console.log(
+      `[proxy] узел "${label}": общая связность — ${generic.ok ? `ok, ip=${generic.body}, ${generic.ms}мс` : `FAIL (${generic.error || generic.status})`}; superkassa.ru — ${target.ok ? `ok, ${target.ms}мс` : `FAIL (${target.error || target.status})`}`
+    );
+
+    if (target.ok) {
+      console.log(`[proxy] узел "${label}" рабочий, использую как прокси`);
       process.env.PROXY_SERVER = `socks5://127.0.0.1:${LOCAL_SOCKS_PORT}`;
       return;
     }
 
-    console.warn(`[proxy] узел "${node.label || node.address}" не отвечает, пробую следующий`);
+    console.warn(`[proxy] узел "${label}" не подходит, пробую следующий`);
     child.kill();
   }
 

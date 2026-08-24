@@ -44,6 +44,8 @@ const CHROMIUM_ARGS = [
 ];
 
 async function checkPrice() {
+  console.log(`[checker] прокси: ${PROXY ? PROXY.server : 'нет, соединение напрямую'}`);
+
   const browser = await chromium.launch({
     headless: true,
     args: CHROMIUM_ARGS,
@@ -58,23 +60,35 @@ async function checkPrice() {
 
     await context.route('**/*', (route, req) => {
       if (AD_DOMAINS.test(req.url()) || BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
-        return route.abort();
+        // Явный код ошибки — иначе Playwright/Chromium помечает abort() как
+        // net::ERR_FAILED, неотличимый в логах requestfailed от настоящего
+        // сетевого сбоя через прокси.
+        return route.abort('blockedbyclient');
       }
       return route.continue();
     });
 
     let offers = [];
     let lastResponseAt = Date.now();
+    // Диагностика: сколько всего ответов /next/api/task пришло за попытку и
+    // сколько из них были status:"ok" — чтобы в логах Render было видно, где
+    // именно затык (прокси вообще не пускает трафик / пускает, но поставщики
+    // не успевают / успевают, но нужного маршрута нет).
+    let taskResponsesSeen = 0;
+    let taskResponsesOk = 0;
+    let requestFailures = 0;
 
     function attachListener(page) {
       page.on('response', async resp => {
         const url = resp.url();
         if (!url.includes('/next/api/task')) return;
+        taskResponsesSeen++;
         let data;
         try {
           const buf = await resp.body();
           data = JSON.parse(buf.toString('utf8'));
-        } catch {
+        } catch (e) {
+          console.log(`[checker] не удалось разобрать ответ /next/api/task: ${e.message}`);
           return;
         }
         lastResponseAt = Date.now();
@@ -83,15 +97,37 @@ async function checkPrice() {
         for (const tid in tasks) {
           const t = tasks[tid];
           if (t.status !== 'ok' || !t.result) continue;
+          taskResponsesOk++;
           offers.push(...findOffers(t, TARGET));
         }
       });
+
+      // requestfailed срабатывает и на наши же намеренные route.abort() (рекламные
+      // домены/картинки-стили) — их отсекаем по errorText, чтобы не шуметь в логах
+      // тем, что мы сами заблокировали, а не тем, что реально не доехало через прокси.
+      page.on('requestfailed', req => {
+        const failure = req.failure();
+        const errorText = failure ? failure.errorText : 'unknown';
+        // Наши собственные route.abort('blockedbyclient') из context.route() —
+        // не диагностический сигнал, отсекаем по префиксу (реальный текст —
+        // "net::ERR_BLOCKED_BY_CLIENT.Inspector", не точное совпадение).
+        if (errorText.startsWith('net::ERR_BLOCKED_BY_CLIENT') || errorText === 'NS_ERROR_ABORT' || errorText === 'net::ERR_ABORTED') return;
+        requestFailures++;
+        console.log(`[checker] сетевой запрос не удался: ${errorText} — ${req.url().slice(0, 150)}`);
+      });
+
+      page.on('pageerror', err => console.log(`[checker] JS-ошибка на странице: ${err.message}`));
     }
 
     let lastError = null;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       offers = [];
       lastError = null;
+      taskResponsesSeen = 0;
+      taskResponsesOk = 0;
+      requestFailures = 0;
+      const attemptStartedAt = Date.now();
+      console.log(`[checker] попытка ${attempt}/${MAX_ATTEMPTS}: открываю страницу поиска...`);
       // Новая страница на каждую попытку, а не повторный goto на старой —
       // Chromium не всегда отдаёт память рендерера обратно после навигации
       // в рамках той же страницы, а тут попытки суммарно могут висеть минутами.
@@ -99,16 +135,29 @@ async function checkPrice() {
       attachListener(page);
       try {
         await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        console.log(`[checker] попытка ${attempt}: страница открылась за ${Date.now() - attemptStartedAt}мс, жду данные...`);
         lastResponseAt = Date.now();
 
         const deadline = Date.now() + MAX_WAIT_MS;
+        let lastHeartbeatAt = Date.now();
         while (Date.now() < deadline && Date.now() - lastResponseAt < IDLE_MS) {
           await page.waitForTimeout(POLL_INTERVAL_MS);
+          if (Date.now() - lastHeartbeatAt >= 10000) {
+            lastHeartbeatAt = Date.now();
+            console.log(
+              `[checker] попытка ${attempt}: ещё жду (${Math.round((Date.now() - attemptStartedAt) / 1000)}с) — ответов: ${taskResponsesSeen} (ok: ${taskResponsesOk}), совпадений: ${offers.length}, сбоев запросов: ${requestFailures}`
+            );
+          }
         }
+        const exitReason = Date.now() >= deadline ? 'исчерпан потолок ожидания' : 'поток ответов затих';
+        console.log(
+          `[checker] попытка ${attempt}: закончил ждать (${exitReason}) — ответов /next/api/task: ${taskResponsesSeen} (ok: ${taskResponsesOk}), совпадений с целевым маршрутом: ${offers.length}, сбоев запросов: ${requestFailures}, всего ${Date.now() - attemptStartedAt}мс`
+        );
       } catch (e) {
         // Сайт иногда просто не открывается за 30с (сетевой сбой/подвисание) —
         // это тоже неудачная попытка, а не повод сразу сдаваться.
         lastError = e;
+        console.log(`[checker] попытка ${attempt}: упала за ${Date.now() - attemptStartedAt}мс с ошибкой: ${e.message} (сбоев запросов до этого: ${requestFailures})`);
       } finally {
         await page.close().catch(() => {});
       }
