@@ -23,4 +23,4 @@ COPY src ./src
 
 EXPOSE 3000
 
-CMD ["node", "src/start.js"]
+CMD ["node", "--expose-gc", "src/start.js"]

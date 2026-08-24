@@ -4,7 +4,7 @@
   "private": true,
   "main": "src/start.js",
   "scripts": {
-    "start": "node src/start.js",
+    "start": "node --expose-gc src/start.js",
     "dry-run": "node scripts/dry-run.js"
   },
   "dependencies": {

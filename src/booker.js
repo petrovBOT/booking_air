@@ -2,6 +2,8 @@ const { chromium } = require('playwright');
 const { SEARCH_URL, AD_DOMAINS, TARGET, PAYMENT_METHOD_LABEL, HEADLESS, PROXY } = require('./config');
 const { getPassenger, getContact } = require('./profile');
 const { findOffers } = require('./matcher');
+const { CHROMIUM_ARGS } = require('./chromium-args');
+const { logMemory } = require('./memlog');
 
 const URLISH_KEY = /url|link|redirect|href|formurl|paymenturl/i;
 
@@ -239,26 +241,8 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
   const PASSENGER = await getPassenger(chatId);
   const CONTACT = await getContact(chatId);
 
-  const browser = await chromium.launch({
-    headless: HEADLESS,
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-background-networking',
-      '--disable-default-apps',
-      '--disable-extensions',
-      '--disable-sync',
-      '--disable-translate',
-      '--metrics-recording-only',
-      '--mute-audio',
-      '--no-first-run',
-      '--safebrowsing-disable-auto-update',
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-    ],
-  });
+  logMemory('attemptBooking: до запуска браузера');
+  const browser = await chromium.launch({ headless: HEADLESS, args: CHROMIUM_ARGS });
 
   try {
     const context = await browser.newContext({
@@ -591,6 +575,9 @@ async function attemptBooking(chatId, onProgress = () => {}, searchUrl = SEARCH_
   } finally {
     if (process.env.DRY_RUN !== 'true') {
       await browser.close().catch(() => {});
+      logMemory('attemptBooking: после закрытия браузера');
+    } else {
+      logMemory('attemptBooking: браузер оставлен открытым (DRY_RUN)');
     }
   }
 }

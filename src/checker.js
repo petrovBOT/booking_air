@@ -1,6 +1,8 @@
 const { chromium } = require('playwright');
 const { SEARCH_URL, AD_DOMAINS, TARGET, PROXY } = require('./config');
 const { findOffers } = require('./matcher');
+const { CHROMIUM_ARGS } = require('./chromium-args');
+const { logMemory } = require('./memlog');
 
 const BLOCKED_RESOURCE_TYPES = new Set(['image', 'font', 'media', 'stylesheet']);
 
@@ -48,31 +50,6 @@ const FIRST_MATCH_GRACE_MS = 5000;
 const MAX_ATTEMPTS = 2;
 const RETRY_DELAY_MS = 15000;
 
-// Render free — 512MB на весь процесс, headless Chromium сам по себе прожорливый.
-// Эти флаги гасят фоновые таймеры/синк/расширения, которые Chromium иначе
-// держит активными даже в headless — без них память на длинных проверках
-// (потолок ожидания в несколько минут) быстрее упирается в лимит.
-const CHROMIUM_ARGS = [
-  '--no-sandbox',
-  '--disable-dev-shm-usage',
-  '--disable-gpu',
-  '--disable-background-networking',
-  '--disable-default-apps',
-  '--disable-extensions',
-  '--disable-sync',
-  '--disable-translate',
-  '--metrics-recording-only',
-  '--mute-audio',
-  '--no-first-run',
-  '--safebrowsing-disable-auto-update',
-  '--disable-background-timer-throttling',
-  '--disable-backgrounding-occluded-windows',
-  '--disable-renderer-backgrounding',
-  // Site Isolation держит отдельный процесс на каждый ориджин — для одной
-  // управляемой страницы это чистый расход памяти без пользы.
-  '--disable-features=site-per-process',
-];
-
 // searchUrl — по умолчанию основная дата (config.SEARCH_URL); /check24
 // передаёт config.SEARCH_URL_DEC24, но вся остальная логика — та же самая.
 async function checkPrice(searchUrl = SEARCH_URL) {
@@ -106,6 +83,12 @@ async function checkPrice(searchUrl = SEARCH_URL) {
   // тело повторного ответа (среди них попадались на несколько мегабайт).
   let completedTaskIds = new Set();
   let skippedRedundantResponses = 0;
+  // Сколько байт тела ответа реально дошло до JSON.parse за попытку — резонов
+  // для памяти сравнимого объёма два: пиковая аллокация Buffer+строки на
+  // JSON.parse и то, сколько её остаётся в offers/completedTaskIds после.
+  // Логируем рядом с memory-замером "после закрытия браузера", чтобы видеть,
+  // коррелирует ли объём распарсенного JSON с ростом RSS процесса.
+  let bytesParsedThisAttempt = 0;
 
   function attachListener(page) {
     // Считаем вообще все запросы (не только /next/api/task) — если их за 18с+
@@ -156,6 +139,7 @@ async function checkPrice(searchUrl = SEARCH_URL) {
       let data;
       try {
         const buf = await resp.body();
+        bytesParsedThisAttempt += buf.length;
         data = JSON.parse(buf.toString('utf8'));
       } catch (e) {
         console.log(`[checker] не удалось разобрать ответ /next/api/task: ${e.message}`);
@@ -206,8 +190,10 @@ async function checkPrice(searchUrl = SEARCH_URL) {
     firstMatchAt = null;
     completedTaskIds = new Set();
     skippedRedundantResponses = 0;
+    bytesParsedThisAttempt = 0;
     const attemptStartedAt = Date.now();
     console.log(`[checker] попытка ${attempt}/${MAX_ATTEMPTS}: открываю страницу поиска...`);
+    logMemory(`checkPrice попытка ${attempt}/${MAX_ATTEMPTS}: до запуска браузера`);
 
     // Свежий браузер целиком на каждую попытку, а не одна долгоживущая
     // инстанция на все попытки — Chromium не всегда отдаёт память рендерера
@@ -289,6 +275,9 @@ async function checkPrice(searchUrl = SEARCH_URL) {
     } finally {
       await browser.close().catch(() => {});
     }
+    logMemory(
+      `checkPrice попытка ${attempt}/${MAX_ATTEMPTS}: после закрытия браузера (JSON распарсено за попытку: ${(bytesParsedThisAttempt / 1024 / 1024).toFixed(1)}MB)`
+    );
 
     if (offers.length > 0) break;
     if (attempt < MAX_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));

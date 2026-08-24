@@ -4,6 +4,7 @@ const { attemptBooking, formatOrderCaption } = require('./booker');
 const { sendMessage, sendPhoto, listenForMessages } = require('./telegram');
 const profile = require('./profile');
 const wizard = require('./wizard');
+const { logMemory, startHeartbeat } = require('./memlog');
 
 // На Render free web-сервисы засыпают без входящего HTTP-трафика — это заглушка
 // под внешний пинг (UptimeRobot/cron-job.org), сам бот с ней никак не взаимодействует.
@@ -87,6 +88,7 @@ async function runCheck(requesterChatId, searchUrl = SEARCH_URL, label = '') {
   inProgressLabel = label;
   const startedAt = Date.now();
   const prefix = label ? `[${label}] ` : '';
+  logMemory(`${prefix}runCheck: начало (проверка + возможное бронирование)`);
   // Итоговый ответ уходит тому, кто запросил проверку, всем, кто написал ту
   // же команду, пока она уже шла (иначе они бы остались без результата
   // вовсе), и владельцу — он получает пуш с результатом каждой проверки.
@@ -125,6 +127,7 @@ async function runCheck(requesterChatId, searchUrl = SEARCH_URL, label = '') {
   } finally {
     checking = false;
     inProgressLabel = null;
+    logMemory(`${prefix}runCheck: конец (${Date.now() - startedAt}мс)`);
   }
 }
 
@@ -235,4 +238,9 @@ listenForMessages(async (chatId, text) => {
   const threshold = await profile.getPriceThreshold();
   console.log(`Бот запущен. Порог цены: ${threshold} ₽. Проверка только по команде /check.`);
   console.log('Разрешённые chat_id:', profile.allowedChatIds().join(', '));
+  // Истинный idle-baseline: сервер, Telegram long-polling и (если поднят) Xray
+  // уже инициализированы, но ни одной проверки/брони ещё не было. Все
+  // последующие "Δrss с самого первого замера" в логах считаются от этой точки.
+  logMemory('бот полностью инициализирован, простаивает');
+  startHeartbeat();
 })();
