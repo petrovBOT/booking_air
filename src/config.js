@@ -35,7 +35,7 @@ module.exports = {
     gender: process.env.PASSENGER_GENDER, // 'M' | 'F'
     birthDate: process.env.PASSENGER_BIRTH_DATE, // ДД.ММ.ГГГГ
     citizenship: process.env.PASSENGER_CITIZENSHIP, // напр. "Россия"
-    documentType: process.env.PASSENGER_DOCUMENT_TYPE, // напр. "Загранпаспорт"
+    documentType: process.env.PASSENGER_DOCUMENT_TYPE, // напр. "Заграничный паспорт РФ" — точный текст опции на сайте
     documentNumber: process.env.PASSENGER_DOCUMENT_NUMBER,
     documentExpireDate: process.env.PASSENGER_DOCUMENT_EXPIRE_DATE || '', // ДД.ММ.ГГГГ, пусто = "Без даты"
     lastName: process.env.PASSENGER_LAST_NAME,

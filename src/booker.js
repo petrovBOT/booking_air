@@ -1,8 +1,28 @@
 const { chromium } = require('playwright');
 const { SEARCH_URL, AD_DOMAINS, TARGET, PAYMENT_METHOD_LABEL, HEADLESS } = require('./config');
 const { getPassenger, getContact } = require('./profile');
+const { findOffers } = require('./matcher');
 
 const URLISH_KEY = /url|link|redirect|href|formurl|paymenturl/i;
+
+// Та же логика ожидания, что и в checker.js: поставщики отвечают асинхронно,
+// ждём затишья в потоке /next/api/task, а не фиксированное время — иначе
+// либо режем медленных поставщиков, либо просто теряем время впустую.
+// MAX_WAIT_MS меньше, чем в checker.js (там 120000) — к моменту вызова
+// attemptBooking цена уже подтверждена checker'ом, и лучше не держать
+// пользователя дольше разумного, но и не резать раньше 30с, которые
+// раньше ждали безусловно.
+const SEARCH_IDLE_MS = 10000;
+const SEARCH_MAX_WAIT_MS = 90000;
+
+// checker.js уже наступал на эти грабли (см. "Повторять поиск при пустом
+// результате" в истории коммитов): нужная пара туда+обратно у поставщиков
+// иногда не складывается с первого поиска, а секунды спустя — складывается.
+// Тут меньше попыток и короче пауза, чем в checker.js (3 и 15000) — цена
+// уже подтверждена, дорожим временем, но одна попытка без повтора слишком
+// хрупкая для той же самой нестабильности выдачи.
+const SEARCH_MAX_ATTEMPTS = 2;
+const SEARCH_RETRY_DELAY_MS = 15000;
 
 function findLinkInJson(obj) {
   if (obj == null) return null;
@@ -274,10 +294,59 @@ async function attemptBooking(chatId, onProgress = () => {}) {
       }
     });
 
+    // Выдача приходит как JSON через /next/api/task (та же логика матчинга,
+    // что и в checker.js/matcher.js) — этого достаточно, чтобы понять, есть ли
+    // вообще нужный рейс в текущей выдаче, до того как трогать HTML.
+    let matchedOffers = [];
+    let lastSearchResponseAt = Date.now();
+    page.on('response', async resp => {
+      const url = resp.url();
+      if (!url.includes('/next/api/task')) return;
+      lastSearchResponseAt = Date.now();
+      let data;
+      try {
+        const buf = await resp.body();
+        data = JSON.parse(buf.toString('utf8'));
+      } catch {
+        return;
+      }
+      const tasks = data.tasks && data.tasks.avia;
+      if (!tasks) return;
+      for (const tid in tasks) {
+        const t = tasks[tid];
+        if (t.status !== 'ok' || !t.result) continue;
+        matchedOffers.push(...findOffers(t, TARGET));
+      }
+    });
+
     onProgress('navigate');
-    await step('переход на страницу поиска', async () => {
-      await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(30000);
+    await step('переход на страницу поиска и ожидание данных выдачи', async () => {
+      // Повторяем поиск с нуля, если первая попытка ничего не нашла для целевого
+      // маршрута — та же нестабильность выдачи, что чинили в checker.js.
+      for (let attempt = 1; attempt <= SEARCH_MAX_ATTEMPTS; attempt++) {
+        matchedOffers = [];
+        await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        lastSearchResponseAt = Date.now();
+        const deadline = Date.now() + SEARCH_MAX_WAIT_MS;
+        while (Date.now() < deadline && Date.now() - lastSearchResponseAt < SEARCH_IDLE_MS) {
+          await page.waitForTimeout(500);
+        }
+        if (matchedOffers.length > 0) return;
+        if (attempt < SEARCH_MAX_ATTEMPTS) {
+          onProgress('navigate-retry');
+          await page.waitForTimeout(SEARCH_RETRY_DELAY_MS);
+        }
+      }
+    });
+
+    onProgress('verify-offer');
+    await step('проверка целевого рейса в JSON-данных выдачи', async () => {
+      // Нет смысла лезть в HTML и перебирать карточки, если по данным с сервера
+      // такого рейса в текущей выдаче вообще нет (цена ушла, рейс распродан и т.п.)
+      // даже после повторных попыток.
+      if (matchedOffers.length === 0) {
+        throw new Error(`целевой рейс не найден в JSON-данных выдачи после ${SEARCH_MAX_ATTEMPTS} попыток — бронирование не запускаю`);
+      }
     });
 
     onProgress('select-flight');
@@ -320,14 +389,29 @@ async function attemptBooking(chatId, onProgress = () => {}) {
 
       // Ищем карточку, где совпадает время рейса ТУДА (обратный подбирается уже
       // внутри выбранной карточки — там точно такой же перевозчик на обоих плечах).
+      // Выдача отдаёт карточки не все разом, а окном штук в 7 — за пределами
+      // видимого окна следующая порция подгружается только по клику на
+      // search-recommendations-scroll-next-button. JSON-проверка шагом выше
+      // уже подтвердила, что нужный рейс в выдаче есть — поэтому здесь имеет
+      // смысл листать дальше, а не сдаваться после первого невидимого окна.
+      const nextPageBtn = page.getByTestId('search-recommendations-scroll-next-button');
       let cardIndex = null;
-      for (let n = 0; n < 30; n++) {
-        const priceEl = page.getByTestId(`search-recommendation${n}-price`);
-        if ((await priceEl.count()) === 0) break;
-        if (await timeMatches(n, 0, TARGET.outbound[0].depTime, TARGET.outbound[0].arrTime)) {
-          cardIndex = n;
-          break;
+      for (let p = 0; p < 40 && cardIndex === null; p++) {
+        for (let n = 0; n < 20; n++) {
+          const priceEl = page.getByTestId(`search-recommendation${n}-price`);
+          if ((await priceEl.count()) === 0) break;
+          if (await timeMatches(n, 0, TARGET.outbound[0].depTime, TARGET.outbound[0].arrTime)) {
+            cardIndex = n;
+            break;
+          }
         }
+        if (cardIndex !== null) break;
+        const canPageMore = (await nextPageBtn.count())
+          ? (await nextPageBtn.isVisible().catch(() => false)) && (await nextPageBtn.isEnabled().catch(() => false))
+          : false;
+        if (!canPageMore) break;
+        await forceClick(nextPageBtn);
+        await page.waitForTimeout(700);
       }
       if (cardIndex === null) {
         if (process.env.DEBUG_SHOT) await page.screenshot({ path: process.env.DEBUG_SHOT, fullPage: true }).catch(() => {});
